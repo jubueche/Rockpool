@@ -103,6 +103,8 @@ class RecFSSpikeADS(Layer):
         self._ts_target = None
         self.recorded_states = None
         self.record = record
+        self.k_initial = k
+        self.eta_initial = eta
 
         self.learning_callback = learning_callback
 
@@ -406,7 +408,7 @@ class RecFSSpikeADS(Layer):
 
             # Call the training. Note this is not spike based (but should probably be). Add "first_spike_id > -1 and" to if to make spike based
             if(self.is_training and self.learning_callback is not None):
-                dot_W_slow = self.learning_callback(weights_slow = self.weights_slow, eta=self.eta, phi_r=phi_r, weights_in=self.weights_in, e = e, dt=self.dt)  # def l(W_slow, eta, phi_r, weights_in, e, dt):
+                dot_W_slow = self.learning_callback(weights_slow = self.weights_slow, phi_r=phi_r, weights_in=self.weights_in, e = e, dt=self.dt)  # def l(W_slow, eta, phi_r, weights_in, e, dt):
                 self.weights_slow = self.weights_slow + self.eta*dot_W_slow
 
             # - Extend spike record, if necessary
@@ -508,7 +510,41 @@ class RecFSSpikeADS(Layer):
             self.recorded_states = resp
 
         # - Return output TimeSeries
-        return TSEvent(spike_times, spike_indices)
+        ts_event_return = TSEvent(spike_times, spike_indices)
+        if(verbose):
+            
+            # Compare the current traces
+            fig = plt.figure(figsize=(20,20))
+            ax0 = fig.add_subplot(511)
+            ax0.plot(times, f[0:5,:].T)
+            ax0.set_title(r"$I_f$")
+
+            ax1 = fig.add_subplot(512)
+            ax1.plot(times, dot_v_ts[0:5,:].T)
+            ax1.set_title(r"$\dot{v}(t)$")
+
+            ax2 = fig.add_subplot(513)
+            ax2.plot(times, I_W_slow_phi_x_track[0:5,:].T)
+            ax2.set_title(r"$I_{W_{slow}^T\phi(r)}$")
+
+            ax3 = fig.add_subplot(514)
+            ax3.plot(np.linspace(0,len(static_input[:,0])/self.dt,len(static_input[:,0])), static_input[:,0:5])
+            ax3.set_title(r"$I_{ext}$")
+            
+            _ = fig.add_subplot(515)
+            ts_event_return.plot()
+            plt.xlim([0,3])
+                
+            plt.tight_layout()
+            plt.show()
+
+            im = plt.matshow(self.weights_slow, fignum=False)
+            plt.xticks([], [])
+            plt.colorbar(im,fraction=0.046, pad=0.04)
+            plt.show()
+                
+
+        return ts_event_return
 
     def to_dict(self):
         NotImplemented
@@ -612,6 +648,7 @@ class RecFSSpikeADS(Layer):
             self._ts_target = t
         else:
             self._ts_target = None
+
         
 
     # Override _prepare_input to also allow preparing the target variable and setting the time base according to the layers dt

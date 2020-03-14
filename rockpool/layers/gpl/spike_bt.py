@@ -12,6 +12,13 @@ import copy
 
 from numba import njit
 
+import matplotlib
+matplotlib.rc('font', family='Times New Roman')
+matplotlib.rc('text', usetex=True)
+matplotlib.rcParams['lines.linewidth'] = 0.5
+matplotlib.rcParams['lines.markersize'] = 0.5
+import matplotlib.pyplot as plt
+
 # - Try to import holoviews
 try:
     import holoviews as hv
@@ -43,6 +50,13 @@ def neuron_dot_v(
 ):
     return (V_rest - V + I_s_S + I_s_F + I_ext + I_bias) / tau_V
 
+@njit
+def neuron_dot_v_ad_ex(V, deltaT, I_s_S, I_s_F, I_ext, V_rest, V_thresh, tau_V, w, R):
+    return (V_rest - V + I_s_S + I_s_F + I_ext + deltaT*np.exp((V-V_thresh)/deltaT) - R*w) / tau_V
+
+@njit
+def neuron_dot_w(a, b, V, V_rest, w, tau_W, ot):
+    return (a*(V-V_rest) - w + b*tau_W*ot)/tau_W
 
 @njit
 def syn_dot_I(t, I, dt, I_spike, tau_Syn):
@@ -79,8 +93,15 @@ class RecFSSpikeEulerBT(Layer):
         v_rest: Union[np.ndarray, float] = -65e-3,
         refractory: float = -np.finfo(float).eps,
         spike_callback: Callable = None,
+        granularity: float = 1,
+        margin: float = 1,
         dt: float = None,
         name: str = None,
+        a_adapt: float = 0.1,
+        b_adapt: float = 0.1,
+        R_adapt: float = 10, # Resistance for the current and adapt. term being fed into system. Just used for w
+        deltaT_adapt: float = 0.1, # Strength of exponential term
+        tau_w: float = 0.001 # Time constant of adaptation parameter. Long time constant means slow decay of adaptation
     ):
         """
         Implement a spiking reservoir with fast and slow recurrent synapses, and a custom solver with precise spike timing.
@@ -130,7 +151,15 @@ class RecFSSpikeEulerBT(Layer):
         self.refractory = float(refractory)
         self.spike_callback = spike_callback
         self.weights_out = weights_out
+        self.granularity = granularity
+        self.margin = margin
+        self.is_training = False
 
+        self.a_adapt = a_adapt
+        self.b_adapt = b_adapt
+        self.deltaT_adapt = deltaT_adapt
+        self.tau_w = tau_w
+        self.R_adapt = R_adapt
 
         # - Set a reasonable dt
         if dt is None:
@@ -202,6 +231,7 @@ class RecFSSpikeEulerBT(Layer):
         spike_pointer = 0
         times = full_nan(record_length)
         v = full_nan((self.size, record_length))
+        w_track = full_nan((self.size, record_length))
         s = full_nan((self.size, record_length))
         f = full_nan((self.size, record_length))
         dot_v_ts = full_nan((self.size, record_length))
@@ -223,9 +253,26 @@ class RecFSSpikeEulerBT(Layer):
         I_s_S_Last = self.I_s_S.copy()
         I_s_F_Last = self.I_s_F.copy()
 
+        w = np.zeros((self.size,))
+        w_last = np.zeros((self.size,))
+
         zeros = np.zeros(self.size)
         # spike = np.nan
         # first_spike_id = 0
+        num_updates = 0
+
+        # For verbose output
+        if(verbose):
+            self.v_n_after = []
+            self.v_n_before = []
+            self.spike_times_n_k = []
+            self.upper_bound = []
+            self.lower_bound = []
+            self.correction_times = []
+            self.neuron_k = 5
+            self.neuron_n = 9
+
+        eye = np.eye(self.size)
 
         # - Euler integrator loop
         while t_time < final_time:
@@ -237,10 +284,12 @@ class RecFSSpikeEulerBT(Layer):
                 weights,
                 weights_slow,
                 state,
+                w,
                 I_s_S,
                 I_s_F,
                 dt,
                 v_last,
+                w_last,
                 I_s_S_Last,
                 I_s_F_Last,
                 v_reset,
@@ -294,6 +343,7 @@ class RecFSSpikeEulerBT(Layer):
 
                     # - Back-step all membrane and synaptic potentials to time of spike (linear interpolation)
                     state = _backstep(state, v_last, dt, spike_delta)
+                    w = _backstep(w, w_last, dt, spike_delta)
                     I_s_S = _backstep(I_s_S, I_s_S_Last, dt, spike_delta)
                     I_s_F = _backstep(I_s_F, I_s_F_Last, dt, spike_delta)
 
@@ -306,17 +356,20 @@ class RecFSSpikeEulerBT(Layer):
                     # - Set spike currents
                     I_spike_slow = weights_slow[:, first_spike_id]
                     I_spike_fast = weights[:, first_spike_id]
+                    ot = eye[:, first_spike_id]
 
                 else:
                     # - Clear spike currents
                     first_spike_id = -1
                     I_spike_slow = zeros
                     I_spike_fast = zeros
+                    ot = zeros
 
                 ### End of back-tick spike detector
 
                 # - Save synapse and neuron states for previous time step
                 v_last[:] = state
+                w_last[:] = w
                 I_s_S_Last[:] = I_s_S + I_spike_slow
                 I_s_F_Last[:] = I_s_F + I_spike_fast
 
@@ -329,21 +382,32 @@ class RecFSSpikeEulerBT(Layer):
 
                 int_time = int((t_time - t_start) // dt)
                 I_ext = static_input[int_time, :]
-                dot_v = neuron_dot_v(
-                    t_time,
-                    state,
-                    dt,
-                    I_s_S,
-                    I_s_F,
-                    I_ext,
-                    bias,
-                    v_rest,
-                    v_reset,
-                    v_thresh,
-                    tau_mem,
-                    tau_syn_r_slow,
-                    tau_syn_r_fast,
-                )
+                # # Standard I&F model
+                # dot_v = neuron_dot_v(
+                #     t_time,
+                #     state,
+                #     dt,
+                #     I_s_S,
+                #     I_s_F,
+                #     I_ext,
+                #     bias,
+                #     v_rest,
+                #     v_reset,
+                #     v_thresh,
+                #     tau_mem,
+                #     tau_syn_r_slow,
+                #     tau_syn_r_fast,
+                # )
+
+                # Use AdEx for dot v
+                # neuron_dot_v_ad_ex(V, deltaT, I_s_S, I_s_F, I_ext, V_rest, V_thresh, tau_V)
+                dot_v = neuron_dot_v_ad_ex(V=state, deltaT=self.deltaT_adapt,I_s_S=I_s_S, I_s_F=I_s_F,I_ext=I_ext,V_rest=v_rest,V_thresh=v_thresh,tau_V=tau_mem,w=w,R=self.R_adapt)
+                # Compute dot w for adaptation
+                # neuron_dot_w(a, b, V, V_rest, w, tau_W, ot)
+                dot_w = neuron_dot_w(a=self.a_adapt, b=self.b_adapt, V=state, V_rest=v_rest, w=w, tau_W=self.tau_w, ot=ot)
+                # Update w
+                w += dot_w * dt
+
                 state += dot_v * dt
 
                 return (
@@ -351,10 +415,12 @@ class RecFSSpikeEulerBT(Layer):
                     first_spike_id,
                     dot_v,
                     state,
+                    w,
                     I_s_S,
                     I_s_F,
                     dt,
                     v_last,
+                    w_last,
                     I_s_S_Last,
                     I_s_F_Last,
                     vec_refractory,
@@ -368,10 +434,12 @@ class RecFSSpikeEulerBT(Layer):
                 first_spike_id,
                 dot_v,
                 self._state,
+                w,
                 self.I_s_S,
                 self.I_s_F,
                 self._dt,
                 v_last,
+                w_last,
                 I_s_S_Last,
                 I_s_F_Last,
                 vec_refractory,
@@ -380,10 +448,12 @@ class RecFSSpikeEulerBT(Layer):
                 self._weights,
                 self.weights_slow,
                 self._state,
+                w,
                 self.I_s_S,
                 self.I_s_F,
                 self._dt,
                 v_last,
+                w_last,
                 I_s_S_Last,
                 I_s_F_Last,
                 self.v_reset,
@@ -399,8 +469,12 @@ class RecFSSpikeEulerBT(Layer):
             )
 
             # - Call spike-based learning callback
-            if first_spike_id > -1 and self.spike_callback is not None:
-                self.spike_callback(self, t_time, first_spike_id)
+            if(first_spike_id > -1 and self.spike_callback is not None and self.is_training):
+                num_updates += self.spike_callback(self, t_time, first_spike_id, v_last, verbose)
+
+            if(verbose):
+                self.lower_bound.append(1/2*(self.granularity/2 + self.margin - 1/50*self.weights[self.neuron_n,self.neuron_k]))
+                self.upper_bound.append(1/2*(-self.granularity/2 - self.margin - 1/50*self.weights[self.neuron_n,self.neuron_k]))
 
             # - Extend spike record, if necessary
             if spike_pointer >= max_spike_pointer:
@@ -419,6 +493,7 @@ class RecFSSpikeEulerBT(Layer):
                 extend = num_timesteps
                 times = np.append(times, full_nan(extend))
                 v = np.append(v, full_nan((self.size, extend)), axis=1)
+                w_track = np.append(w_track, full_nan((self.size, extend)), axis=1)
                 s = np.append(s, full_nan((self.size, extend)), axis=1)
                 f = np.append(f, full_nan((self.size, extend)), axis=1)
                 dot_v_ts = np.append(dot_v_ts, full_nan((self.size, extend)), axis=1)
@@ -427,6 +502,7 @@ class RecFSSpikeEulerBT(Layer):
             # - Store the network states for this time step
             times[step] = t_time
             v[:, step] = self._state
+            w_track[:, step] = w
             s[:, step] = self.I_s_S
             f[:, step] = self.I_s_F
             dot_v_ts[:, step] = dot_v
@@ -439,6 +515,7 @@ class RecFSSpikeEulerBT(Layer):
         ### End of Euler integration loop
 
         ## - Back-step to exact final time
+        w = _backstep(w, w_last, self._dt, t_time - final_time)
         self.state = _backstep(self.state, v_last, self._dt, t_time - final_time)
         self.I_s_S = _backstep(self.I_s_S, I_s_S_Last, self._dt, t_time - final_time)
         self.I_s_F = _backstep(self.I_s_F, I_s_F_Last, self._dt, t_time - final_time)
@@ -446,12 +523,14 @@ class RecFSSpikeEulerBT(Layer):
         ## - Store the network states for final time step
         times[step - 1] = final_time
         v[:, step - 1] = self.state
+        w_track[:, step -1] = w
         s[:, step - 1] = self.I_s_S
         f[:, step - 1] = self.I_s_F
 
         ## - Trim state storage variables
         times = times[:step]
         v = v[:, :step]
+        w_track = w_track[:, :step]
         s = s[:, :step]
         f = f[:, :step]
         dot_v_ts = dot_v_ts[:, :step]
@@ -487,6 +566,41 @@ class RecFSSpikeEulerBT(Layer):
         self._last_evolve = resp
         self._timestep += num_timesteps
 
+        print("Number of updates : %d" % num_updates)
+
+        # For testing AdExp
+        # fig = plt.figure(figsize=(20,5))
+        # plt.subplot(211)
+        # plt.plot(times, w_track[0,:].T)
+        # plt.subplot(212)
+        # plt.plot(times, v[0,:].T)
+        # plt.show()
+
+        if(verbose and len(self.spike_times_n_k)>0):
+            
+            # Print number of updates and plot the margins
+            fig = plt.figure(figsize=(10,10))
+            plt.title(r'\textbf{A:} Behaviour of the learning algorithm')
+            time_base = np.linspace(0, final_time, len(self.upper_bound))
+            mean_diff_size = np.mean(np.asarray(self.v_n_after) - np.asarray(self.v_n_before))
+            mean_diff_around = np.mean(np.asarray(self.v_n_after) + np.asarray(self.v_n_before))
+            for idx,t in enumerate(self.spike_times_n_k):
+                if(t in self.correction_times):
+                    plt.plot((t,t), (self.v_n_after[idx],self.v_n_before[idx]), '-', color='r')
+                else:
+                    plt.plot((t,t), (self.v_n_after[idx],self.v_n_before[idx]), '-', color='y')
+            plt.plot(self.spike_times_n_k,self.v_n_before, 'bo', label=r"$V_{\textnormal{before}}$")
+            plt.plot(self.spike_times_n_k,self.v_n_after, 'go', label=r"$V_{\textnormal{after}}$")
+            plt.plot(time_base, self.upper_bound, label="Upper bound")
+            plt.plot(time_base, self.lower_bound, label="Lower bound")
+            plt.ylabel(r"V(t)")
+            plt.xlabel(r"t (ms)")
+            # plt.axhline(y=mean_diff_size, color=(0.4,0.4,0.1,1.0), label=r"Mean $V_{\textnormal{before}} + V_{\textnormal{after}}$")
+            plt.axhline(y=self.v_thresh[self.neuron_n], color=(0.4,0.9,0.3,1.0), label=r"$V_{\textnormal{thresh}}$")
+            plt.legend()
+
+            plt.show()
+            
         # - Return output TimeSeries
         return TSEvent(spike_times, spike_indices)
 

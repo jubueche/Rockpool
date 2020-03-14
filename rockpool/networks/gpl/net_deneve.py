@@ -5,8 +5,11 @@
 from ..network import Network
 from ...layers import PassThrough, FFExpSyn, FFExpSynBrian
 from ...layers import RecFSSpikeEulerBT
+from ...timeseries import TSContinuous
 
 import numpy as np
+
+import matplotlib.pyplot as plt
 
 # - Configure exports
 __all__ = ["NetworkDeneve"]
@@ -135,6 +138,50 @@ class NetworkDeneve(Network):
             refractory=refractory,
         )
 
+
+    def train(self, func, omega_optimal, num_iterations, fCommandAmp, nNumVariables, sigma, tDt, tDuration, verbose = False, validation_step = 10):
+        """
+        Arguments: self: Network object, access layer attributes self.lyrRes.XX
+                   func: Function to generate random input. Takes duration, dt, Amp, Nx, sigma as parameters
+                   num_iterations: Number of total training iterations
+                   verbose: Track number of updates, decoding error, distance to optimal weights
+                   validation_step : Validate on new input after X iterations and produce verbose output
+        """
+        print("Start training...")
+        t = np.linspace(0, tDuration, int(tDuration / tDt))
+        def get_ts_input():
+            rv = func(duration=tDuration, dt=tDt, Amp=fCommandAmp,Nx=nNumVariables,sigma=sigma)
+            return TSContinuous(t,rv.T)
+
+        def get_distance(Copt, C):
+            optscale = np.trace(np.matmul(C.T, Copt)) / np.sum(Copt**2)
+            Cnorm = np.sum(C**2)
+            ErrorC = np.sum(np.sum((C - optscale*Copt)**2 ,axis=0)) / Cnorm
+            return ErrorC
+
+        for i in range(num_iterations):
+
+            if(i % validation_step == 0):
+                self.lyrRes.is_training = False
+                ts_input = get_ts_input()
+                dResp = self.evolve(ts_input, tDuration, verbose=False)
+                print("Distance to optimal weights is %.4f" % get_distance(omega_optimal, self.lyrRes.weights))
+                self.reset_all()
+
+            #self.margin = np.log(i + 1)
+            #print("Margin is %.4f" % self.margin)
+
+            self.lyrRes.is_training = True
+            ts_input = get_ts_input()
+            dResp = self.evolve(ts_input, tDuration, verbose=False)
+            self.reset_all()
+
+
+        self.lyrRes.is_training = False
+        self.reset_all()
+
+
+
     @staticmethod
     def SpecifyNetwork(
         weights_fast,
@@ -151,6 +198,8 @@ class NetworkDeneve(Network):
         tau_syn_r_slow: float = 100e-3,
         tau_syn_out: float = 100e-3,
         refractory: float = -np.finfo(float).eps,
+        granularity: float = 1,
+        margin: float = 1,
     ):
         """
         SpecifyNetwork - Directly configure all layers of a reservoir
@@ -176,6 +225,55 @@ class NetworkDeneve(Network):
 
         :return:
         """
+
+        # Spike callback
+        def spike_callback(layer, time, spike_id, v_last, verbose=False):
+            """
+            Implements the discrete learning rule.
+            Condition for incrementing fOmega{n,k} by w : 2*v_last{n} + fOmega{n,k} < -w/2 - margin
+            Condition for decrementing fOmega{n,k} by w : 2*v_last{n} + fOmega{n,k} >  w/2 + margin
+
+            Incrementing or decrementing the fOmega{i,i} corresponds to incrementing or decrementing the
+            reset potential.
+            The diagonal of fOmega is always zero and the relation V_reset = V_thresh + diagonal(Omega) holds,
+            where the thresholds are fixed throughout training and the weights are assumed to be -(FF.T + mu*I)
+            """
+            k = spike_id
+            num_updates = 0
+            if(verbose and k == layer.neuron_k):
+                layer.spike_times_n_k.append(time)
+                layer.v_n_before.append(v_last[layer.neuron_n])
+                layer.v_n_after.append(layer._state[layer.neuron_n])
+
+            for n in range(layer.size):
+                # Check for connection Omega{n,k}
+                if(n == k):
+                    omega_n_k = layer.v_reset[n] + layer.v_thresh[n]
+                else:
+                    omega_n_k = layer._weights[n,k] / 20
+
+                if(2*v_last[n] + omega_n_k < -layer.granularity/2 - layer.margin):
+                    num_updates += 1
+                    if(n == k):
+                        layer.v_reset[n] += 0.1
+                        layer.v_rest[n] += 0.1
+                    else:
+                        layer._weights[n,k] += layer.granularity
+                        if(verbose and k == layer.neuron_k and n == layer.neuron_n):
+                            layer.correction_times.append(time)
+                            
+                elif(2*v_last[n] + omega_n_k > layer.granularity/2 + layer.margin):
+                    num_updates += 1
+                    if(n == k):
+                        layer.v_reset[n] -= 0.1
+                        layer.v_rest[n] -= 0.1
+                    else:
+                        layer._weights[n,k] -= layer.granularity
+                        if(verbose and k == layer.neuron_k and n == layer.neuron_n):
+                            layer.correction_times.append(time)
+
+            return num_updates
+
         # - Construct reservoir
         reservoir_layer = RecFSSpikeEulerBT(
             weights_fast,
@@ -189,7 +287,10 @@ class NetworkDeneve(Network):
             v_rest=v_rest,
             v_reset=v_reset,
             refractory=refractory,
-            name="Deneve_Reservoir",
+            spike_callback=spike_callback,
+            granularity=granularity,
+            margin=margin,
+            name="DeneveReservoir",
         )
 
         # - Ensure time step is consistent across layers
