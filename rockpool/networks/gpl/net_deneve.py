@@ -226,7 +226,6 @@ class NetworkDeneve(Network):
         :return:
         """
 
-        # Spike callback
         def spike_callback(layer, time, spike_id, v_last, verbose=False):
             """
             Implements the discrete learning rule.
@@ -238,6 +237,7 @@ class NetworkDeneve(Network):
             The diagonal of fOmega is always zero and the relation V_reset = V_thresh + diagonal(Omega) holds,
             where the thresholds are fixed throughout training and the weights are assumed to be -(FF.T + mu*I)
             """
+
             k = spike_id
             num_updates = 0
             if(verbose and k == layer.neuron_k):
