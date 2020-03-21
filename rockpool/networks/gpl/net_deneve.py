@@ -303,7 +303,7 @@ class NetworkDeneve(Network):
         # - Construct output layer
         output_layer = FFExpSyn(
             weights_out,
-            dt=1e-4,
+            dt=dt,
             noise_std=noise_std,
             tau_syn=tau_syn_out,
             name="Output",
