@@ -217,16 +217,6 @@ class NetworkADS(Network):
                 out_val = val_sim["output_layer"].samples.T
                 self.reset_all()
 
-                if(verbose > 0):
-                    fig = plt.figure(figsize=(20,5))
-                    plt.plot(time_base, out_val[0:2,:].T, label=r"Reconstructed")
-                    plt.plot(time_base, target_val[0:2,:].T, label=r"Target")
-                    plt.title(r"Target vs reconstruction")
-                    plt.legend()
-                    plt.draw()
-                    plt.waitforbuttonpress(0)
-                    plt.close(fig)
-
                 if(target_val.ndim == 1):
                     target_val = np.reshape(target_val, (out_val.shape))
                     target_val = target_val.T
@@ -236,8 +226,20 @@ class NetworkADS(Network):
                 network_response_smoothed = running_mean(out_val.T, N_filter)
                 network_response_smoothed_padded[:,int((N_filter-1)/2):network_response_smoothed.shape[0]+int((N_filter-1)/2)] = network_response_smoothed.T
 
-                err = np.sum(np.var(target_val-out_val, axis=0, ddof=1)) / (np.sum(np.var(target_val, axis=0, ddof=1)))
+                if(verbose > 0):
+                    fig = plt.figure(figsize=(20,5))
+                    l1 = plt.plot(time_base, network_response_smoothed_padded[0:2,:].T, color="C2")
+                    l2 = plt.plot(time_base, target_val[0:2,:].T, color="C4")
+                    lines = [l1[0],l2[0]]
+                    plt.title(r"Target vs reconstruction")
+                    plt.legend(lines,["Reconstructed","Target"])
+                    plt.draw()
+                    plt.waitforbuttonpress(0)
+                    plt.close(fig)
+
+                # err = np.sum(np.var(target_val-out_val, axis=0, ddof=1)) / (np.sum(np.var(target_val, axis=0, ddof=1)))
                 err = np.sum(np.var(target_val-network_response_smoothed_padded, axis=0, ddof=1)) / (np.sum(np.var(target_val, axis=0, ddof=1)))
+                # err = np.sum(np.linalg.norm(target_val-network_response_smoothed_padded, axis=1)/np.linalg.norm(target_val,axis=1)) / target_val.shape[0]
                 errors.append(err)
                 self.lyrRes.ts_target = None
             return np.mean(np.asarray(errors)), np.mean(np.asarray(variances))
