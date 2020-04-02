@@ -382,31 +382,31 @@ class RecFSSpikeEulerBT(Layer):
 
                 int_time = int((t_time - t_start) // dt)
                 I_ext = static_input[int_time, :]
-                # # Standard I&F model
-                # dot_v = neuron_dot_v(
-                #     t_time,
-                #     state,
-                #     dt,
-                #     I_s_S,
-                #     I_s_F,
-                #     I_ext,
-                #     bias,
-                #     v_rest,
-                #     v_reset,
-                #     v_thresh,
-                #     tau_mem,
-                #     tau_syn_r_slow,
-                #     tau_syn_r_fast,
-                # )
+                # Standard I&F model
+                dot_v = neuron_dot_v(
+                    t_time,
+                    state,
+                    dt,
+                    I_s_S,
+                    I_s_F,
+                    I_ext,
+                    bias,
+                    v_rest,
+                    v_reset,
+                    v_thresh,
+                    tau_mem,
+                    tau_syn_r_slow,
+                    tau_syn_r_fast,
+                )
 
-                # Use AdEx for dot v
-                # neuron_dot_v_ad_ex(V, deltaT, I_s_S, I_s_F, I_ext, V_rest, V_thresh, tau_V)
-                dot_v = neuron_dot_v_ad_ex(V=state, deltaT=self.deltaT_adapt,I_s_S=I_s_S, I_s_F=I_s_F,I_ext=I_ext,V_rest=v_rest,V_thresh=v_thresh,tau_V=tau_mem,w=w,R=self.R_adapt)
-                # Compute dot w for adaptation
-                # neuron_dot_w(a, b, V, V_rest, w, tau_W, ot)
-                dot_w = neuron_dot_w(a=self.a_adapt, b=self.b_adapt, V=state, V_rest=v_rest, w=w, tau_W=self.tau_w, ot=ot)
-                # Update w
-                w += dot_w * dt
+                # # Use AdEx for dot v
+                # # neuron_dot_v_ad_ex(V, deltaT, I_s_S, I_s_F, I_ext, V_rest, V_thresh, tau_V)
+                # dot_v = neuron_dot_v_ad_ex(V=state, deltaT=self.deltaT_adapt,I_s_S=I_s_S, I_s_F=I_s_F,I_ext=I_ext,V_rest=v_rest,V_thresh=v_thresh,tau_V=tau_mem,w=w,R=self.R_adapt)
+                # # Compute dot w for adaptation
+                # # neuron_dot_w(a, b, V, V_rest, w, tau_W, ot)
+                # dot_w = neuron_dot_w(a=self.a_adapt, b=self.b_adapt, V=state, V_rest=v_rest, w=w, tau_W=self.tau_w, ot=ot)
+                # # Update w
+                # w += dot_w * dt
 
                 state += dot_v * dt
 
@@ -473,8 +473,8 @@ class RecFSSpikeEulerBT(Layer):
                 num_updates += self.spike_callback(self, t_time, first_spike_id, v_last, verbose)
 
             if(verbose):
-                self.lower_bound.append(1/2*(self.granularity/2 + self.margin - 1/50*self.weights[self.neuron_n,self.neuron_k]))
-                self.upper_bound.append(1/2*(-self.granularity/2 - self.margin - 1/50*self.weights[self.neuron_n,self.neuron_k]))
+                self.lower_bound.append(1/2*(self.granularity/2 + self.margin - self.tau_mem*self.weights[self.neuron_n,self.neuron_k]))
+                self.upper_bound.append(1/2*(-self.granularity/2 - self.margin - self.tau_mem*self.weights[self.neuron_n,self.neuron_k]))
 
             # - Extend spike record, if necessary
             if spike_pointer >= max_spike_pointer:
@@ -566,7 +566,8 @@ class RecFSSpikeEulerBT(Layer):
         self._last_evolve = resp
         self._timestep += num_timesteps
 
-        print("Number of updates : %d" % num_updates)
+        if(self.is_training):
+            print("Number of updates : %d" % num_updates)
 
         # For testing AdExp
         # fig = plt.figure(figsize=(20,5))
@@ -663,10 +664,7 @@ class RecFSSpikeEulerBT(Layer):
 
     @Layer.dt.setter
     def dt(self, new_dt):
-        assert (
-            new_dt <= self._min_tau / 10
-        ), "`new_dt` must be shorter than 1/10 of the shortest time constant, for numerical stability."
-
+      
         # - Call super-class setter
         super(RecFSSpikeEulerBT, RecFSSpikeEulerBT).dt.__set__(self, new_dt)
 

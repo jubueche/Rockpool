@@ -153,20 +153,47 @@ class NetworkDeneve(Network):
             rv = func(duration=tDuration, dt=tDt, Amp=fCommandAmp,Nx=nNumVariables,sigma=sigma)
             return TSContinuous(t,rv.T)
 
+        val_set = [get_ts_input() for _ in range(10)]
+
         def get_distance(Copt, C):
             optscale = np.trace(np.matmul(C.T, Copt)) / np.sum(Copt**2)
             Cnorm = np.sum(C**2)
             ErrorC = np.sum(np.sum((C - optscale*Copt)**2 ,axis=0)) / Cnorm
             return ErrorC
 
+        def get_decoding_error():
+            """
+            Computes average error over validation set
+            """
+            errors = []
+            for ts_rv in val_set:
+                dResp = self.evolve(ts_rv, tDuration, verbose=False)
+                self.reset_all()
+                reconstructed = dResp['Output'].samples[:int(tDuration/tDt),:]
+                target = ts_rv.samples / fCommandAmp
+                scales = np.linalg.pinv(reconstructed.T @ reconstructed) @ reconstructed.T @ target
+                recon = scales @ reconstructed.T
+                err = np.sum(np.var(target-recon.T, axis=0, ddof=1)) / (np.sum(np.var(target, axis=0, ddof=1)))
+                errors.append(err)
+
+            return np.mean(np.asarray(errors))
+
+
+        iter_num = []
+        distance_to_optimal_weights = []
+        decoding_error = []
+
         for i in range(num_iterations):
 
             if(i % validation_step == 0):
                 self.lyrRes.is_training = False
-                ts_input = get_ts_input()
-                dResp = self.evolve(ts_input, tDuration, verbose=False)
-                print("Distance to optimal weights is %.4f" % get_distance(omega_optimal, self.lyrRes.weights))
-                self.reset_all()
+                err = get_decoding_error()
+                decoding_error.append(err)
+                self.lyrRes.is_training = True
+                dist = get_distance(omega_optimal, self.lyrRes.weights)
+                iter_num.append(i)
+                distance_to_optimal_weights.append(dist)
+                print("Distance to optimal weights is %.4f" % dist)
 
             #self.margin = np.log(i + 1)
             #print("Margin is %.4f" % self.margin)
@@ -179,6 +206,8 @@ class NetworkDeneve(Network):
 
         self.lyrRes.is_training = False
         self.reset_all()
+
+        return (iter_num,distance_to_optimal_weights,decoding_error)
 
 
 
@@ -250,7 +279,7 @@ class NetworkDeneve(Network):
                 if(n == k):
                     omega_n_k = layer.v_reset[n] + layer.v_thresh[n]
                 else:
-                    omega_n_k = layer._weights[n,k] / 20
+                    omega_n_k = layer._weights[n,k] * tau_mem
 
                 if(2*v_last[n] + omega_n_k < -layer.granularity/2 - layer.margin):
                     num_updates += 1
