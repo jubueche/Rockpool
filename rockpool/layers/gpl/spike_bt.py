@@ -409,6 +409,7 @@ class RecFSSpikeEulerBT(Layer):
                 # w += dot_w * dt
 
                 state += dot_v * dt
+                state[state < 0] = 0.0
 
                 return (
                     t_time,

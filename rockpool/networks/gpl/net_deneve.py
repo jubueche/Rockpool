@@ -281,21 +281,23 @@ class NetworkDeneve(Network):
                 else:
                     omega_n_k = layer._weights[n,k] * tau_mem
 
-                if(2*v_last[n] + omega_n_k < -layer.granularity/2 - layer.margin):
+                if(2*v_last[n] + omega_n_k < -layer.granularity/2 + 2*layer.v_rest[n]):
                     num_updates += 1
                     if(n == k):
-                        layer.v_reset[n] += 0.1
-                        layer.v_rest[n] += 0.1
+                        # layer.v_reset[n] += 0.1
+                        # layer.v_rest[n] += 0.1
+                        pass
                     else:
                         layer._weights[n,k] += layer.granularity
                         if(verbose and k == layer.neuron_k and n == layer.neuron_n):
                             layer.correction_times.append(time)
                             
-                elif(2*v_last[n] + omega_n_k > layer.granularity/2 + layer.margin):
+                elif(2*v_last[n] + omega_n_k > layer.granularity/2 + 2*layer.v_rest[n]):
                     num_updates += 1
                     if(n == k):
-                        layer.v_reset[n] -= 0.1
-                        layer.v_rest[n] -= 0.1
+                        # layer.v_reset[n] -= 0.1
+                        # layer.v_rest[n] -= 0.1
+                        pass
                     else:
                         layer._weights[n,k] -= layer.granularity
                         if(verbose and k == layer.neuron_k and n == layer.neuron_n):
