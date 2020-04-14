@@ -547,6 +547,7 @@ class RecFSSpikeEulerBT(Layer):
             "mfFast": f,
             "dot_v": dot_v_ts,
             "static_input": static_input,
+            "v": v,
         }
 
         backend = get_global_ts_plotting_backend()

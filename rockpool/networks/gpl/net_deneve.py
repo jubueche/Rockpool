@@ -183,6 +183,8 @@ class NetworkDeneve(Network):
         distance_to_optimal_weights = []
         decoding_error = []
 
+        fig = plt.figure(figsize=(7,5))
+
         for i in range(num_iterations):
 
             if(i % validation_step == 0):
@@ -202,6 +204,23 @@ class NetworkDeneve(Network):
             ts_input = get_ts_input()
             dResp = self.evolve(ts_input, tDuration, verbose=False)
             self.reset_all()
+
+            # Draw
+            plt.clf()
+            num_neurons = 8 # Plot the voltages and net currents for that many neurons
+            net_current = self.lyrRes._last_evolve['f'] # + self.lyrRes._last_evolve['static_input']
+            v = self.lyrRes._last_evolve['v']
+            times = self.lyrRes._last_evolve['vt']
+            c = 1
+            base = num_neurons*100+10+0
+            for idx in range(num_neurons):
+                ax = fig.add_subplot(base+c)
+                ax.plot(times, v[idx,:].T)
+                c+= 1
+
+            plt.tight_layout()
+            plt.draw()
+            plt.pause(0.2)
 
 
         self.lyrRes.is_training = False
