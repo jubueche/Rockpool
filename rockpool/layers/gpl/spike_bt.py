@@ -540,6 +540,7 @@ class RecFSSpikeEulerBT(Layer):
         ## - Construct return time series
         resp = {
             "vt": times,
+            "v": v,
             "mfX": v,
             "s": s,
             "f": f,
