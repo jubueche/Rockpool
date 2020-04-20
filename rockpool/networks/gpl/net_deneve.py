@@ -211,6 +211,9 @@ class NetworkDeneve(Network):
             net_current = self.lyrRes._last_evolve['f'] # + self.lyrRes._last_evolve['static_input']
             v = self.lyrRes._last_evolve['v']
             times = self.lyrRes._last_evolve['vt']
+            # Fluctuation around rest
+            fluc = np.mean(np.var(v.T-self.lyrRes.v_rest, axis=0))
+            print("Fluctuation: %.4f" % fluc)
             c = 1
             base = num_neurons*100+10+0
             for idx in range(num_neurons):
