@@ -2252,10 +2252,13 @@ class FFExpSynCurrentInJax(Layer, JaxTrainer):
 
     def to_dict(self) -> Dict:
         """ Convert this layer to a dictionary representation """
-        dLayer = super().to_dict()
-        dLayer['weights'] = onp.array(dLayer['weights']).tolist()
-        dLayer['tau'] = self.tau.item()
-        return dLayer
+        config =  super().to_dict()
+        config.pop("weights")
+        config["weights"] = onp.array(self.weights).tolist()
+        config["rng_key"] = onp.array(self._rng_key).tolist()
+        config["tau"] = onp.array(self.tau).tolist()
+        return config
+
 
     @property
     def tau(self):

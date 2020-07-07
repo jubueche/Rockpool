@@ -13,6 +13,8 @@ from jax import jit
 from jax.experimental.optimizers import adam
 import jax.numpy as np
 
+import json
+
 Params = List
 State = List
 
@@ -261,3 +263,17 @@ class JaxStack(Network, Layer, JaxTrainer):
 
     def to_dict(self):
         return Network.to_dict(self)
+
+    @staticmethod
+    def load(filename: str) -> "JaxStack":
+        """
+        Load a network from a JSON file
+
+        :param str filename:    filename of a JSON file that contains a saved network
+        :return JaxStack:        A JaxStack object with all the layers loaded from `filename`
+        """
+        # - Load dict holding the parameters
+        with open(filename, "r") as f:
+            loaddict: dict = json.load(f)
+        net = Network.load_from_dict(loaddict)
+        return JaxStack([l for l in net.evol_order])
