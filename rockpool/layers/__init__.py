@@ -55,6 +55,7 @@ dModules = {
         "FFLIFCurrentInJax_SO",
         "FFExpSynCurrentInJax",
         "FFExpSynJax",
+        "JaxFORCE"
     ),
 }
 

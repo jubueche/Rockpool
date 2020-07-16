@@ -3,17 +3,25 @@
 #
 
 # - Imports
+from warnings import warn
 from ..layer import Layer
 from ..training import JaxTrainer
 from ...timeseries import TSContinuous, TSEvent
 
 from jax import numpy as np
+from jax import vmap
 import numpy as onp
 
 import jax
 from jax import jit, custom_gradient
 from jax.lax import scan
 import jax.random as rand
+
+# - TODO Remove
+import os
+import psutil
+import gc
+import jax.profiler
 
 from typing import Optional, Tuple, Union, Dict, Callable, Any
 
@@ -38,6 +46,7 @@ __all__ = [
     "FFLIFCurrentInJax_SO",
     "FFExpSynCurrentInJax",
     "FFExpSynJax",
+    "JaxFORCE"
 ]
 
 
@@ -793,9 +802,9 @@ class RecLIFJax(Layer, JaxTrainer):
         if hasattr(self, "dt"):
             tau_min = self.dt * 10.0
             numeric_eps = 1e-8
-            assert np.all(
-                value - tau_min + numeric_eps >= 0
-            ), "`tau_mem` must be larger than {:4f}".format(tau_min)
+            # assert np.all(
+            #     value - tau_min + numeric_eps >= 0
+            # ), "`tau_mem` must be larger than {:4f}".format(tau_min)
 
         self._tau_mem = np.reshape(value, self._size).astype("float32")
 
@@ -820,9 +829,9 @@ class RecLIFJax(Layer, JaxTrainer):
         if hasattr(self, "dt"):
             tau_min = self.dt * 10.0
             numeric_eps = 1e-8
-            assert np.all(
-                value - tau_min + numeric_eps >= 0
-            ), "`tau_syn` must be larger than {:4f}".format(tau_min)
+            # assert np.all(
+            #     value - tau_min + numeric_eps >= 0
+            # ), "`tau_syn` must be larger than {:4f}".format(tau_min)
 
         self._tau_syn = np.reshape(value, self._size).astype("float32")
 
@@ -2380,3 +2389,423 @@ class FFExpSynJax(FFExpSynCurrentInJax):
 
         # - Return output currents
         return self._i_syn_last_evolution
+
+
+# - TODO Write documentation
+class JaxFORCE(Layer):
+
+    def __init__(self,
+                    w_in : np.ndarray,
+                    w_rec : np.ndarray,
+                    w_out : np.ndarray,
+                    E : np.ndarray,
+                    dt : float,
+                    alpha : float,
+                    v_thresh : float = -40,
+                    v_reset : float = -65,
+                    t_ref : float = 0.002,
+                    bias : float = -40,
+                    tau_mem : float = 0.01,
+                    tau_syn : float  = 0.02,
+                    noise_std : float = 0.0,
+                    name : str = "JaxFORCE"
+                    ):
+
+        super().__init__(weights=onp.array(w_rec), dt=dt, noise_std=noise_std, name=name)
+
+        self.w_in = onp.array(w_in)
+        self.w_rec = onp.array(w_rec)
+        self.w_out = onp.array(w_out)
+        self.E = onp.array(E)
+        self.alpha = alpha
+        self.v_thresh = onp.array(v_thresh)
+        self.v_reset = onp.array(v_reset)
+        self.t_ref = t_ref
+        self.bias = onp.array(bias)
+        self.tau_mem = onp.array(tau_mem)
+        self.tau_syn = onp.array(tau_syn)
+        self._state = {}
+        self._rng_key = rand.PRNGKey(1) # - TODO How to handle these keys?
+        self.reset_state()
+        self.randomize_state()
+        self.PInv = np.eye(self.size)*self.alpha
+
+    def reset_state(self):
+        self.state = {"spikes": np.zeros((self.size,1)),
+                        "Vmem": np.zeros((self.size,1)),
+                        "Isyn": np.zeros((self.size,1)),
+                        "t": 0,
+                        "tlast": np.zeros((self.size,1)),
+                        "r": np.zeros((self.size,1))}
+
+    def randomize_state(self):
+        _, subkey = rand.split(self._rng_key) # TODO Nicer?
+        tmp = self.state; tmp["Vmem"] = self.v_reset.reshape((-1,1)) + rand.uniform(subkey, shape=(self.size,1))*(30-self.v_reset.reshape((-1,1)))
+        self.state = tmp
+
+    @property
+    def _evolve_functional(self):
+
+        def evol_func(
+            params: Params, is_learning: bool, sp_input_ts: np.ndarray,
+        ) -> Tuple[np.ndarray, State, Dict[str, np.ndarray]]:
+            # - Call the jitted evolution function for this layer
+            # - Prepare the input
+            if(is_learning):
+                # - Unpack input and target
+                (inps, I_target) = sp_input_ts
+            else:
+                inps = sp_input_ts
+                I_target = None
+
+            (
+                new_state,
+                Vmem_ts,
+                spikes_ts,
+                r_ts,
+                output_ts,
+                PInv,
+                w_out
+            ) = _evolve_jit_FORCE(
+                state0 = self.state,
+                w_in = self.w_in,
+                w_rec = self.w_rec,
+                w_out = params["w_out"],
+                PInv = params["PInv"],
+                tau_mem = self.tau_mem,
+                tau_syn = self.tau_syn,
+                bias = self.bias,
+                t_ref = self.t_ref,
+                v_thresh = self.v_thresh,
+                v_reset = self.v_reset,
+                noise_std = self.noise_std,
+                I_input = inps,
+                key = self._rng_key,
+                dt = self.dt,
+                alpha = self.alpha,
+                is_learning = is_learning,
+                E = self.E,
+                I_target = I_target
+            )
+
+            # - Return the outputs from this layer, and the final layer state
+            states_t = {
+                "Vmem": Vmem_ts,
+                "r": r_ts,
+                "output_ts": output_ts,
+                "PInv": PInv,
+                "w_out": w_out
+            }
+            return spikes_ts, new_state, states_t
+
+        # - Return the evolution function
+        return evol_func
+
+    def _pack(self):
+        return {
+            "w_out": self.w_out,
+            "PInv": self.PInv
+            }
+    
+    def _unpack(self, params):
+        self.PInv = params["PInv"]
+        self.w_out = params["w_out"]
+
+    def prepare_input(self,ts_input,duration = None,num_timesteps = None):
+        if(isinstance(ts_input, np.ndarray)):
+            # - Check if we need to add an extra dimension for batch
+            inps = ts_input
+            if(ts_input.ndim == 1):
+                inps = np.reshape(ts_input, (1,-1,1))
+            elif(ts_input.ndim == 2):
+                inps = np.reshape(ts_input, (1,ts_input.shape[0],ts_input.shape[1]))
+            elif(ts_input.ndim > 3):
+                raise Exception("Number of input dimensions unequal to 1 or 2")
+        elif(isinstance(ts_input,TSContinuous)):
+            _, inps, _ = self._prepare_input(ts_input, duration, num_timesteps)
+            inps = np.reshape(inps, (1,inps.shape[0],inps.shape[1]))
+        else:
+            raise Exception("Please input np.ndarray or TSContinuous type for input")
+        num_timesteps = inps.shape[1]-1 # - TODO Ex. 14999 is returned for TSCon. with 15000 dim. (?)
+        time_base = np.arange(0,inps.shape[1]*self.dt,self.dt)
+        return (num_timesteps,time_base,inps)
+
+    def evolve(
+        self,
+        ts_input: Optional[TSEvent] = None,
+        duration: Optional[float] = None,
+        num_timesteps: Optional[int] = None,
+        verbose: bool = False,
+    ):
+        num_timesteps,_,inps = self.prepare_input(ts_input, duration=duration, num_timesteps=num_timesteps)
+        _, _, states_t = vmap(self._evolve_functional, in_axes=(None,None,0))(self._pack(), False,inps)
+        self._timestep += num_timesteps # - TODO (?)
+        return np.squeeze(states_t["output_ts"], axis=-1)
+
+    def train_output_target(self,
+                            ts_input,
+                            ts_target,
+                            duration: Optional[float] = None,
+                            num_timesteps: Optional[int] = None,
+                            verbose: bool = False
+                            ):
+
+        num_timesteps,_,inps = self.prepare_input(ts_input, duration=duration, num_timesteps=num_timesteps)
+        _,_,targets = self.prepare_input(ts_target)
+        process = psutil.Process(os.getpid())
+        print("1",process.memory_info().rss)  # in bytes
+        _, _, states_t = vmap(self._evolve_functional, in_axes=(None,None,0))(self._pack(), True,(inps,targets))
+        states_t["output_ts"].block_until_ready()
+        process = psutil.Process(os.getpid())
+        print("2",process.memory_info().rss)  # in bytes
+
+        # jax.profiler.save_device_memory_profile("memory.prof")
+
+        # - Perform update
+        self.w_out = onp.array(np.mean(states_t["w_out"], axis=0))
+        self.PInv = onp.array(np.mean(states_t["PInv"], axis=0))
+        output = np.squeeze(onp.array(states_t["output_ts"]), axis=-1)
+
+        self._timestep += num_timesteps # - TODO (?)
+        return output
+
+    def to_dict(self):
+        config = super().to_dict()
+        config.pop("weights")
+        config["w_in"] = onp.array(self.w_in).tolist()
+        config["w_rec"] = onp.array(self.w_rec).tolist()
+        config["w_out"] = onp.array(self.w_out).tolist()
+        config["E"] = onp.array(self.E).tolist()
+        config["alpha"] = float(self.alpha)
+        config["v_thresh"] = onp.array(self.v_thresh).tolist()
+        config["v_reset"] = onp.array(self.v_reset).tolist()
+        config["t_ref"] = float(self.t_ref)
+        config["bias"] = onp.array(self.bias).tolist()
+        config["tau_mem"] = onp.array(self.tau_mem).tolist()
+        config["tau_syn"] = onp.array(self.tau_syn).tolist()
+        config["PInv"] = onp.array(self.PInv).tolist()
+        config["rng_key"] = onp.array(self._rng_key).tolist()
+        return config
+
+    @classmethod
+    def load_from_dict(cls: Any, config: Dict, **kwargs):
+        # - Overwrite parameters with kwargs
+        config = dict(config, **kwargs)
+        PInv = config.pop("PInv")
+        config.pop("rng_key")
+        # - Remove class name from dict
+        config.pop("class_name")
+        lyr = cls(**config)
+        lyr.PInv = onp.array(PInv)
+        return lyr
+
+    @property
+    def tau_syn(self):
+        return onp.array(self._tau_syn)
+    @tau_syn.setter
+    def tau_syn(self, value):
+        self._tau_syn = onp.array(self._expand_to_net_size(value, "tau_syn", False))
+
+    @property
+    def tau_mem(self):
+        return onp.array(self._tau_mem)
+    @tau_mem.setter
+    def tau_mem(self, value):
+        self._tau_mem = onp.array(self._expand_to_net_size(value, "tau_mem", False))
+
+    @property
+    def bias(self):
+        return onp.array(self._bias)
+    @bias.setter
+    def bias(self, value):
+        self._bias = onp.array(self._expand_to_net_size(value, "bias", False))
+
+    @property
+    def v_thresh(self):
+        return onp.array(self._v_thresh)
+    @v_thresh.setter
+    def v_thresh(self, value):
+        self._v_thresh = onp.array(self._expand_to_net_size(value, "v_thresh", False))
+
+    @property
+    def v_reset(self):
+        return onp.array(self._v_reset)
+    @v_reset.setter
+    def v_reset(self, value):
+        self._v_reset = onp.array(self._expand_to_net_size(value, "v_reset", False))
+
+    @property
+    def state(self):
+        """
+        Internal state of the neurons in this layer
+        :return: dict{"Vmem", "Isyn", "spikes", "t", "tlast"}
+        """
+        return {k: np.array(v) for k, v in self._state.items()}
+
+    @state.setter
+    def state(self, new_state):
+        """
+        Setter for state values. Verifies that new state dict contains correct keys and sizes.
+        """
+        # - Verify that `new_state` contains the correct keys
+        if (
+            "Vmem" not in new_state.keys()
+            or "Isyn" not in new_state.keys()
+            or "spikes" not in new_state.keys()
+            or "t" not in new_state.keys()
+            or "tlast" not in new_state.keys()
+            or "r" not in new_state.keys()
+        ):
+            raise ValueError(
+                "`new_state` must be a dict containing keys 'Vmem', 'Isyn', 'spikes', 't' and 'tlast'."
+            )
+
+        # - Update state dictionary
+        self._state.update(new_state)
+
+    def _prepare_input_continuous(
+        self,
+        ts_input: Optional[TSContinuous] = None,
+        duration: Optional[float] = None,
+        num_timesteps: Optional[int] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, int]:
+        """
+        Sample input, set up time base
+
+        This function checks an input signal, and prepares a discretised time base according to the time step of the current layer
+
+        :param Optional[TSContinuous] ts_input: :py:class:`.TSContinuous` of TxM or Tx1 Input signals for this layer
+        :param Optional[float] duration:        Duration of the desired evolution, in seconds. If not provided, then either ``num_timesteps`` or the duration of ``ts_input`` will define the evolution time
+        :param Optional[int] num_timesteps:     Integer number of evolution time steps, in units of ``.dt``. If not provided, then ``duration`` or the duration of ``ts_input`` will define the evolution time
+
+        :return (ndarray, ndarray, int): (time_base, input_steps, num_timesteps)
+            time_base:      T1 Discretised time base for evolution
+            input_steps:    (T1xN) Discretised input signal for layer
+            num_timesteps:  Actual number of evolution time steps, in units of ``.dt``
+        """
+
+        # - Work out how many time steps to take
+        num_timesteps = self._determine_timesteps(ts_input, duration, num_timesteps)
+
+        # - Generate discrete time base
+        time_base = self._gen_time_trace(self.t, num_timesteps)
+
+        if ts_input is not None:
+            # - Make sure time_base matches ts_input
+            if not isinstance(ts_input, TSEvent):
+                if not ts_input.periodic:
+                    # - If time base limits are very slightly beyond ts_input.t_start and ts_input.t_stop, match them
+                    if (
+                        ts_input.t_start - 1e-3 * self.dt
+                        <= time_base[0]
+                        <= ts_input.t_start
+                    ):
+                        time_base[0] = ts_input.t_start
+                    if (
+                        ts_input.t_stop
+                        <= time_base[-1]
+                        <= ts_input.t_stop + 1e-3 * self.dt
+                    ):
+                        time_base[-1] = ts_input.t_stop
+
+                # - Warn if evolution period is not fully contained in ts_input
+                if not (ts_input.contains(time_base) or ts_input.periodic):
+                    warn(
+                        "Layer `{}`: Evolution period (t = {} to {}) ".format(
+                            self.name, time_base[0], time_base[-1]
+                        )
+                        + "is not fully contained in input signal (t = {} to {}).".format(
+                            ts_input.t_start, ts_input.t_stop
+                        )
+                        + " You may need to use a `periodic` time series."
+                    )
+
+            # - Sample input trace and check for correct dimensions
+            input_steps = ts_input(time_base)
+
+            # - Treat "NaN" as zero inputs
+            input_steps[np.where(np.isnan(input_steps))] = 0
+
+        else:
+            # - Assume zero inputs
+            input_steps = np.zeros((np.size(time_base), self.size_in))
+
+        return time_base, input_steps, num_timesteps
+
+def _evolve_jit_FORCE(state0,
+                        w_in,
+                        w_rec,
+                        w_out,
+                        PInv,
+                        tau_mem,
+                        tau_syn,
+                        bias,
+                        t_ref,
+                        v_thresh,
+                        v_reset,
+                        noise_std,
+                        I_input,
+                        key,
+                        dt,
+                        alpha,
+                        is_learning,
+                        E,
+                        I_target):
+
+        tau_syn = tau_syn.reshape((-1,1))
+        tau_mem = tau_mem.reshape((-1,1))
+        v_thresh = v_thresh.reshape((-1,1))
+        v_reset = v_reset.reshape((-1,1))
+        bias = bias.reshape((-1,1))
+        tau_mem_kernel = (dt / tau_mem)
+        exp_tau_syn_kernel = np.exp(-dt / tau_syn)
+
+        state = state0
+        training_step = 50
+
+        def forward_train(train_state, input_target_pair):
+            (w_out, PInv, state) = train_state
+            (I_input_ts, I_target_ts) = input_target_pair
+            (w_out,state), (_, _, _, z) = forward((w_out, state), I_input_ts)
+            # if(state["t"] % training_step == 0): # - TODO
+            err = z - I_target_ts.reshape((-1,1))
+            cd = PInv @ state["r"]
+            w_out = w_out - (cd @ err.T)
+            PInv = PInv - (cd @ cd.T)/ (1 + state["r"].T @ cd)
+            return (w_out, PInv, state), (state["Vmem"],state["spikes"],state["r"], z)
+
+        def forward(evolve_state, I_input_ts):
+            (w_out, state) = evolve_state
+            z = w_out.T @ state["r"]
+            I = state["Isyn"] + E @ z + (I_input_ts @ w_in).reshape((-1,1)) + bias
+            dv = ((dt*state["t"])>(state["tlast"] + t_ref)).astype(np.int32) * (-state["Vmem"]+I)
+            state["Vmem"] = state["Vmem"] + tau_mem_kernel * dv
+            state["spikes"] = (state["Vmem"]>=v_thresh).astype(np.float32)
+            I_rec = (w_rec @ state["spikes"]).reshape((-1,1))
+            state["tlast"] = state["tlast"] + (dt*state["t"] -state['tlast']) * state["spikes"]
+            state["Isyn"] = state["Isyn"]*exp_tau_syn_kernel + I_rec/tau_syn
+            state["r"] = state["r"] * exp_tau_syn_kernel + state["spikes"]/tau_syn
+            state["Vmem"] = state["Vmem"] + (30 - state["Vmem"]) * state["spikes"]
+            state["Vmem"] = state["Vmem"] + (v_reset - state["Vmem"]) * state["spikes"]
+            state["t"] += 1
+            return (w_out, state), (state["Vmem"],state["spikes"],state["r"], z)
+
+        # - Create membrane potential noise trace
+        num_timesteps = I_input.shape[0]
+        _, subkey = rand.split(key)
+        noise_ts = noise_std * rand.normal(
+            subkey, shape=(num_timesteps, I_input.shape[1])
+        )
+
+        I_input = I_input + noise_ts
+
+        if(not is_learning):
+            (w_out,state), (Vmem_ts, spikes_ts, r_ts, output_ts) = scan(forward,
+                            (w_out,state0),
+                            I_input)
+        else:
+            (w_out,PInv,state), (Vmem_ts, spikes_ts, r_ts, output_ts) = scan(forward_train,
+                            (w_out,PInv,state0),
+                            (I_input, I_target))
+
+        return state, Vmem_ts, spikes_ts, r_ts, output_ts, PInv, w_out
