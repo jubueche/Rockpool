@@ -2430,6 +2430,9 @@ class JaxFORCE(Layer):
         self.randomize_state()
         self.PInv = np.eye(self.size)*self.alpha
 
+        # - For memory debugging
+        self.mem_id = 0
+
     def reset_state(self):
         self.state = {"spikes": np.zeros((self.size,1)),
                         "Vmem": np.zeros((self.size,1)),
@@ -2559,12 +2562,13 @@ class JaxFORCE(Layer):
         process = psutil.Process(os.getpid())
         print("2",process.memory_info().rss)  # in bytes
 
-        # jax.profiler.save_device_memory_profile("memory.prof")
+        # jax.profiler.save_device_memory_profile(f"memory{self.mem_id}.prof")
+        # self.mem_id += 1
 
         # - Perform update
         self.w_out = onp.array(np.mean(states_t["w_out"], axis=0))
         self.PInv = onp.array(np.mean(states_t["PInv"], axis=0))
-        output = np.squeeze(onp.array(states_t["output_ts"]), axis=-1)
+        output = onp.squeeze(onp.array(states_t["output_ts"]), axis=-1)
 
         self._timestep += num_timesteps # - TODO (?)
         return output
