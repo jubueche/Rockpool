@@ -2555,12 +2555,12 @@ class JaxFORCE(Layer):
 
         num_timesteps,_,inps = self.prepare_input(ts_input, duration=duration, num_timesteps=num_timesteps)
         _,_,targets = self.prepare_input(ts_target)
-        process = psutil.Process(os.getpid())
-        print("1",process.memory_info().rss)  # in bytes
+        # process = psutil.Process(os.getpid())
+        # print("1",process.memory_info().rss)  # in bytes
         _, _, states_t = vmap(self._evolve_functional, in_axes=(None,None,0))(self._pack(), True,(inps,targets))
         states_t["output_ts"].block_until_ready()
-        process = psutil.Process(os.getpid())
-        print("2",process.memory_info().rss)  # in bytes
+        # process = psutil.Process(os.getpid())
+        # print("2",process.memory_info().rss)  # in bytes
 
         # jax.profiler.save_device_memory_profile(f"memory{self.mem_id}.prof")
         # self.mem_id += 1
@@ -2765,13 +2765,11 @@ def _evolve_jit_FORCE(state0,
         exp_tau_syn_kernel = np.exp(-dt / tau_syn)
 
         state = state0
-        training_step = 50
 
         def forward_train(train_state, input_target_pair):
             (w_out, PInv, state) = train_state
             (I_input_ts, I_target_ts) = input_target_pair
             (w_out,state), (_, _, _, z) = forward((w_out, state), I_input_ts)
-            # if(state["t"] % training_step == 0): # - TODO
             err = z - I_target_ts.reshape((-1,1))
             cd = PInv @ state["r"]
             w_out = w_out - (cd @ err.T)
