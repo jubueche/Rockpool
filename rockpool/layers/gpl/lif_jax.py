@@ -2766,31 +2766,33 @@ def _evolve_jit_FORCE(state0,
 
         state = state0
 
+        @jit
         def forward_train(train_state, input_target_pair):
-            (w_out, PInv, state) = train_state
+            (w_out, PInv, state,static_params) = train_state
             (I_input_ts, I_target_ts) = input_target_pair
-            (w_out,state), (_, _, _, z) = forward((w_out, state), I_input_ts)
+            (w_out,state,static_params), (_, _, _, z) = forward((w_out,state,static_params), I_input_ts)
             err = z - I_target_ts.reshape((-1,1))
             cd = PInv @ state["r"]
             w_out = w_out - (cd @ err.T)
             PInv = PInv - (cd @ cd.T)/ (1 + state["r"].T @ cd)
-            return (w_out, PInv, state), (state["Vmem"],state["spikes"],state["r"], z)
+            return (w_out, PInv, state, static_params), (state["Vmem"],state["spikes"],state["r"], z)
 
+        @jit
         def forward(evolve_state, I_input_ts):
-            (w_out, state) = evolve_state
+            (w_out, state, static_params) = evolve_state
             z = w_out.T @ state["r"]
-            I = state["Isyn"] + E @ z + (I_input_ts @ w_in).reshape((-1,1)) + bias
-            dv = ((dt*state["t"])>(state["tlast"] + t_ref)).astype(np.int32) * (-state["Vmem"]+I)
-            state["Vmem"] = state["Vmem"] + tau_mem_kernel * dv
-            state["spikes"] = (state["Vmem"]>=v_thresh).astype(np.float32)
-            I_rec = (w_rec @ state["spikes"]).reshape((-1,1))
-            state["tlast"] = state["tlast"] + (dt*state["t"] -state['tlast']) * state["spikes"]
-            state["Isyn"] = state["Isyn"]*exp_tau_syn_kernel + I_rec/tau_syn
-            state["r"] = state["r"] * exp_tau_syn_kernel + state["spikes"]/tau_syn
+            I = state["Isyn"] + static_params["E"] @ z + (I_input_ts @ static_params["w_in"]).reshape((-1,1)) + static_params["bias"]
+            dv = ((static_params["dt"]*state["t"])>(state["tlast"] + static_params["t_ref"])).astype(np.int32) * (-state["Vmem"]+I)
+            state["Vmem"] = state["Vmem"] + static_params["tau_mem_kernel"] * dv
+            state["spikes"] = (state["Vmem"]>=static_params["v_thresh"]).astype(np.float32)
+            I_rec = (static_params["w_rec"] @ state["spikes"]).reshape((-1,1))
+            state["tlast"] = state["tlast"] + (static_params["dt"]*state["t"] -state['tlast']) * state["spikes"]
+            state["Isyn"] = state["Isyn"]*static_params["exp_tau_syn_kernel"] + I_rec/static_params["tau_syn"]
+            state["r"] = state["r"] * static_params["exp_tau_syn_kernel"] + state["spikes"]/static_params["tau_syn"]
             state["Vmem"] = state["Vmem"] + (30 - state["Vmem"]) * state["spikes"]
-            state["Vmem"] = state["Vmem"] + (v_reset - state["Vmem"]) * state["spikes"]
+            state["Vmem"] = state["Vmem"] + (static_params["v_reset"] - state["Vmem"]) * state["spikes"]
             state["t"] += 1
-            return (w_out, state), (state["Vmem"],state["spikes"],state["r"], z)
+            return (w_out, state, static_params), (state["Vmem"],state["spikes"],state["r"], z)
 
         # - Create membrane potential noise trace
         num_timesteps = I_input.shape[0]
@@ -2801,13 +2803,26 @@ def _evolve_jit_FORCE(state0,
 
         I_input = I_input + noise_ts
 
+        static_params = {}
+        static_params["v_thresh"] = v_thresh
+        static_params["v_reset"] = v_reset
+        static_params["bias"] = bias
+        static_params["tau_mem_kernel"] = tau_mem_kernel
+        static_params["exp_tau_syn_kernel"] = exp_tau_syn_kernel
+        static_params["tau_syn"] = tau_syn
+        static_params["dt"] = dt
+        static_params["E"] = E
+        static_params["w_rec"] = w_rec
+        static_params["w_in"] = w_in
+        static_params["t_ref"] = t_ref
+
         if(not is_learning):
-            (w_out,state), (Vmem_ts, spikes_ts, r_ts, output_ts) = scan(forward,
-                            (w_out,state0),
+            (w_out,state,_), (Vmem_ts, spikes_ts, r_ts, output_ts) = scan(forward,
+                            (w_out,state0, static_params),
                             I_input)
         else:
-            (w_out,PInv,state), (Vmem_ts, spikes_ts, r_ts, output_ts) = scan(forward_train,
-                            (w_out,PInv,state0),
+            (w_out,PInv,state,_), (Vmem_ts, spikes_ts, r_ts, output_ts) = scan(forward_train,
+                            (w_out,PInv,state0,static_params),
                             (I_input, I_target))
 
         return state, Vmem_ts, spikes_ts, r_ts, output_ts, PInv, w_out
