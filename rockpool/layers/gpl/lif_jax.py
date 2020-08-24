@@ -2470,26 +2470,48 @@ class JaxFORCE(Layer):
                 PInv,
                 w_out
             ) = _evolve_jit_FORCE(
-                state0 = self.state,
-                w_in = self.w_in,
-                w_rec = self.w_rec,
-                w_out = params["w_out"],
-                PInv = params["PInv"],
-                tau_mem = self.tau_mem,
-                tau_syn = self.tau_syn,
-                bias = self.bias,
-                t_ref = self.t_ref,
-                v_thresh = self.v_thresh,
-                v_reset = self.v_reset,
-                noise_std = self.noise_std,
-                I_input = inps,
-                key = self._rng_key,
-                dt = self.dt,
-                alpha = self.alpha,
-                is_learning = is_learning,
-                E = self.E,
-                I_target = I_target
+                self.state,
+                self.w_in,
+                self.w_rec,
+                params["w_out"],
+                params["PInv"],
+                self.tau_mem,
+                self.tau_syn,
+                self.bias,
+                self.t_ref,
+                self.v_thresh,
+                self.v_reset,
+                self.noise_std,
+                inps,
+                self._rng_key,
+                self.dt,
+                self.alpha,
+                is_learning,
+                self.E,
+                I_target
             )
+
+            # _evolve_jit_FORCE(
+            #     state0 = self.state,
+            #     w_in = self.w_in,
+            #     w_rec = self.w_rec,
+            #     w_out = params["w_out"],
+            #     PInv = params["PInv"],
+            #     tau_mem = self.tau_mem,
+            #     tau_syn = self.tau_syn,
+            #     bias = self.bias,
+            #     t_ref = self.t_ref,
+            #     v_thresh = self.v_thresh,
+            #     v_reset = self.v_reset,
+            #     noise_std = self.noise_std,
+            #     I_input = inps,
+            #     key = self._rng_key,
+            #     dt = self.dt,
+            #     alpha = self.alpha,
+            #     is_learning = is_learning,
+            #     E = self.E,
+            #     I_target = I_target
+            # )
 
             # - Return the outputs from this layer, and the final layer state
             states_t = {
@@ -2736,6 +2758,7 @@ class JaxFORCE(Layer):
 
         return time_base, input_steps, num_timesteps
 
+@jax.partial(jax.jit, static_argnums=(16,))
 def _evolve_jit_FORCE(state0,
                         w_in,
                         w_rec,
