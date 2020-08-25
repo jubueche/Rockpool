@@ -277,7 +277,7 @@ class JaxTrainer(ABC):
         :param bool debug_nans:         If ``True``, ``nan`` s will raise an ``AssertionError``, and display some feedback about where and when the ``nan`` s occur. Default: ``False``, do not check for ``nan`` s. Note: Checking for ``nan`` s slows down training considerably.
         :param Callable loss_fcn:       Function that computes the loss for the currently configured layer. Default: :py:func:`loss_mse_reg`
         :param Dict loss_params:        A dictionary of loss function parameters to pass to the loss function. Must be configured on the very first call to `.train_output_target`; subsequent changes will be ignored. Default: Appropriate parameters for :py:func:`loss_mse_reg`.
-        :param bool loss_aux:           Flag to indicate that instead of a scalar the loss function returns a tuple of length 2, consisting of the scalar loss and some auxiliary data that can be accessed after training through :py:attr:`~.JaxTrainer.loss_aux_data`.
+        :param bool loss_aux:           Flag to indicate that instead of a scalar the loss function returns a tuple of length 2, consisting of the scalar loss and some auxiliary data.
         :param Callable optimizer:      A JAX-style optimizer function. See the JAX docs for details. Default: :py:func:`jax.experimental.optimizers.adam`
         :param Dict opt_params:         A dictionary of parameters passed to :py:func:`optimizer`. Default: ``{"step_size": 1e-4}``
         :param Optional[int] batch_axis: Axis over which to extract batch samples and map through the gradient and loss measurements. To use batches, you must pre-rasterise ``ts_input`` and ``ts_target``. If ``None`` (default), no batching is performed. If not ``None``, `batch_axis` defines the axis of ``ts_input`` and ``ts_target`` to pass to :py:func:`jax.vmap` as the batch axis.
@@ -464,10 +464,12 @@ class JaxTrainer(ABC):
 
                     if loss_aux:
                         lss, aux = lss
+                        lss = np.mean(lss, axis=batch_axis)
+                        return (lss, aux), grd
 
-                    lss = np.mean(lss, axis=batch_axis)
-
-                    return lss, grd
+                    else:
+                        lss = np.mean(lss, axis=batch_axis)
+                        return lss, grd
 
                 self.__loss_fcn = jit(loss_batch)
                 self.__grad_fcn = jit(grad_batch)
@@ -522,10 +524,6 @@ class JaxTrainer(ABC):
             grad_out = self.__grad_fcn(
                 self.__get_params(self.__opt_state), inps, target, self._state
             )
-            if loss_aux:
-                # - Ignore aux output from loss function
-                (lss, aux), grd = grad_out
-                grad_out = (lss, grd)
             return grad_out
 
         def o_fcn():
@@ -607,8 +605,6 @@ class JaxTrainer(ABC):
         self.__opt_state, loss, grads = self.__update_fcn(
             next(self.__itercount), self.__opt_state, inps, target
         )
-        if loss_aux:
-            self.loss_aux_data.append(loss[1])
 
         # - Apply the parameter updates
         new_params = self.__get_params(self.__opt_state)
