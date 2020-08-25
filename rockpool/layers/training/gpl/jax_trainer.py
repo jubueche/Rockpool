@@ -447,21 +447,27 @@ class JaxTrainer(ABC):
                     loss_b = vmap(
                         loss_curried, in_axes=(None, batch_axis, batch_axis, None)
                     )(*args, **kwargs)
-                    return np.mean(loss_b, axis=batch_axis)
+                    if loss_aux:
+                        return np.mean(loss_b[0], axis=batch_axis), loss_b[1]
+                    else:
+                        return np.mean(loss_b, axis=batch_axis)
 
                 def grad_batch(*args, **kwargs):
                     """ Batch mean gradient function """
-                    l, g = vmap(
-                        value_and_grad(loss_curried),
+                    lss, grd = vmap(
+                        value_and_grad(loss_curried, has_aux=loss_aux),
                         in_axes=(None, batch_axis, batch_axis, None),
                     )(*args, **kwargs)
-                    g, tree_def = tree_flatten(g)
-                    g = [np.mean(g_item, axis=batch_axis) for g_item in g]
-                    g = tree_unflatten(tree_def, g)
+                    grd, tree_def = tree_flatten(grd)
+                    grd = [np.mean(g_item, axis=batch_axis) for g_item in grd]
+                    grd = tree_unflatten(tree_def, grd)
 
-                    l = np.mean(l, axis=batch_axis)
+                    if loss_aux:
+                        lss, aux = lss
 
-                    return l, g
+                    lss = np.mean(lss, axis=batch_axis)
+
+                    return lss, grd
 
                 self.__loss_fcn = jit(loss_batch)
                 self.__grad_fcn = jit(grad_batch)
@@ -471,7 +477,7 @@ class JaxTrainer(ABC):
             else:
                 # - No batching
                 self.__loss_fcn = jit(loss_curried)
-                self.__grad_fcn = jit(value_and_grad(loss_curried))
+                self.__grad_fcn = jit(value_and_grad(loss_curried, has_aux=loss_aux))
                 self.__evolve_functional = jit(self._evolve_functional)
 
             # - Initialise optimizer
