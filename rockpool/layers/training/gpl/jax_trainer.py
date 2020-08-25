@@ -261,6 +261,7 @@ class JaxTrainer(ABC):
         debug_nans: bool = False,
         loss_fcn: Callable[[Dict, Tuple], float] = None,
         loss_params: Dict = {},
+        loss_aux: bool = False,
         optimizer: Callable = adam,
         opt_params: Dict = {"step_size": 1e-4},
         batch_axis=None,
@@ -276,6 +277,7 @@ class JaxTrainer(ABC):
         :param bool debug_nans:         If ``True``, ``nan`` s will raise an ``AssertionError``, and display some feedback about where and when the ``nan`` s occur. Default: ``False``, do not check for ``nan`` s. Note: Checking for ``nan`` s slows down training considerably.
         :param Callable loss_fcn:       Function that computes the loss for the currently configured layer. Default: :py:func:`loss_mse_reg`
         :param Dict loss_params:        A dictionary of loss function parameters to pass to the loss function. Must be configured on the very first call to `.train_output_target`; subsequent changes will be ignored. Default: Appropriate parameters for :py:func:`loss_mse_reg`.
+        :param bool loss_aux:           Flag to indicate that instead of a scalar the loss function returns a tuple of length 2, consisting of the scalar loss and some auxiliary data that can be accessed after training through :py:attr:`~.JaxTrainer.loss_aux_data`.
         :param Callable optimizer:      A JAX-style optimizer function. See the JAX docs for details. Default: :py:func:`jax.experimental.optimizers.adam`
         :param Dict opt_params:         A dictionary of parameters passed to :py:func:`optimizer`. Default: ``{"step_size": 1e-4}``
         :param Optional[int] batch_axis: Axis over which to extract batch samples and map through the gradient and loss measurements. To use batches, you must pre-rasterise ``ts_input`` and ``ts_target``. If ``None`` (default), no batching is performed. If not ``None``, `batch_axis` defines the axis of ``ts_input`` and ``ts_target`` to pass to :py:func:`jax.vmap` as the batch axis.
@@ -341,11 +343,15 @@ class JaxTrainer(ABC):
 
             def loss(params: Params, output_batch_t: np.ndarray, target_batch_t: np.ndarray, **loss_params) -> float:
 
+        or::
+
+            def loss(params: Params, output_batch_t: np.ndarray, target_batch_t: np.ndarray, **loss_params) -> Tuple[float, Any]:
+
         ``loss_params`` will be a dictionary of whatever arguments you would like to pass to your loss function. ``params`` will be a set of parameters returned by the layer :py:meth:`_pack` method.
 
         ``output_batch_t`` and ``target_batch_t`` will be rasterised versions of time series, for the output of the layer given the current parameters, and for the target signal, respectively. Both are computed for the current batch, and are aligned in time.
 
-        :py:func:`.loss` must return a scalar float of the calculated loss value for the current batch. You can use the values in ``params`` to compute regularisation terms. You may not modify anything in ``params``. You *must* implement :py:func:`.loss` using `jax.numpy`, and :py:func:`.loss` *must* be compilable by `jax.jit`.
+        :py:func:`.loss` must return a scalar float of the calculated loss value for the current batch. It can return an additional object containing auxiliary data, in which case ``loss_aux`` has to be ``True``. You can use the values in ``params`` to compute regularisation terms. You may not modify anything in ``params``. You *must* implement :py:func:`.loss` using `jax.numpy`, and :py:func:`.loss` *must* be compilable by `jax.jit`.
 
         :return (loss, grads, output_fcn):
                                 ``loss``:   float The current loss for this batch/sample
@@ -360,6 +366,9 @@ class JaxTrainer(ABC):
             # - Get optimiser
             (opt_init, opt_update, get_params) = optimizer(**deepcopy(opt_params))
             self.__get_params = get_params
+
+            # - List for storing auxiliary loss output
+            self.loss_aux_data = [] if loss_aux else None
 
             # - Make update function
             @jit
@@ -504,9 +513,14 @@ class JaxTrainer(ABC):
             )
 
         def g_fcn():
-            return self.__grad_fcn(
+            grad_out = self.__grad_fcn(
                 self.__get_params(self.__opt_state), inps, target, self._state
             )
+            if loss_aux:
+                # - Ignore aux output from loss function
+                (lss, aux), grd = grad_out
+                grad_out = (lss, grd)
+            return grad_out
 
         def o_fcn():
             return self.__evolve_functional(
@@ -530,7 +544,8 @@ class JaxTrainer(ABC):
                     )
 
             # - Check loss function
-            if np.isnan(l_fcn()):
+            lss = l_fcn()[0] if loss_aux else l_fcn()
+            if np.isnan(lss):
                 str_error += "Loss function returned NaN\n"
 
             # - Check outputs
@@ -564,6 +579,10 @@ class JaxTrainer(ABC):
                         target[:step, :],
                         self._state,
                     )
+                    if loss_aux:
+                        # - Ignore aux output from loss function
+                        (lss, aux), grd = gradients_limited
+                        gradients_limited = (lss, grd)
 
                     for k, v in flatten(gradients_limited).items():
                         if np.any(np.isnan(v)):
@@ -582,6 +601,8 @@ class JaxTrainer(ABC):
         self.__opt_state, loss, grads = self.__update_fcn(
             next(self.__itercount), self.__opt_state, inps, target
         )
+        if loss_aux:
+            self.loss_aux_data.append(loss[1])
 
         # - Apply the parameter updates
         new_params = self.__get_params(self.__opt_state)
