@@ -265,7 +265,11 @@ class JaxTrainer(ABC):
         optimizer: Callable = adam,
         opt_params: Dict = {"step_size": 1e-4},
         batch_axis=None,
-    ) -> Tuple[float, Dict[str, Any], Callable[[], Tuple[np.ndarray, State]]]:
+    ) -> Tuple[
+        Union[float, Tuple[float, Any]],
+        Dict[str, Any],
+        Callable[[], Tuple[np.ndarray, State]],
+    ]:
         """
         Perform one trial of Adam stochastic gradient descent to train the layer
 
@@ -354,7 +358,7 @@ class JaxTrainer(ABC):
         :py:func:`.loss` must return a scalar float of the calculated loss value for the current batch. It can return an additional object containing auxiliary data, in which case ``loss_aux`` has to be ``True``. You can use the values in ``params`` to compute regularisation terms. You may not modify anything in ``params``. You *must* implement :py:func:`.loss` using `jax.numpy`, and :py:func:`.loss` *must* be compilable by `jax.jit`.
 
         :return (loss, grads, output_fcn):
-                                ``loss``:   float The current loss for this batch/sample
+                                ``loss``:   Union[float, Tuple[float, Any]] ``loss_aux`` is ``False``, the current loss for this batch/sample. Otherwise a tuple with the current loss as first element and the aux output of the loss function as second element.
                                 ``grad_fcn``:   Dict[str,Any] PyTree of gradients for the this batch/sample
                                 ``output_fcn``: Callable[[], Tuple[np.ndarray, State, Dict]] Function that returns the layer output for the current batch, the new internal states, and a dictionary of internal state time series for the evolution
         """
@@ -366,9 +370,6 @@ class JaxTrainer(ABC):
             # - Get optimiser
             (opt_init, opt_update, get_params) = optimizer(**deepcopy(opt_params))
             self.__get_params = get_params
-
-            # - List for storing auxiliary loss output
-            self.loss_aux_data = [] if loss_aux else None
 
             # - Make update function
             @jit
