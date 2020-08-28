@@ -2138,7 +2138,7 @@ class FFExpSynCurrentInJax(Layer, JaxTrainer):
         """ Convert this layer to a dictionary representation """
         dLayer = super().to_dict()
         dLayer.pop("weights")
-        dLayer["w_out"] = onp.array(dLayer["w_out"]).tolist()
+        dLayer["w_out"] = onp.array(self._w_out).tolist()
         dLayer["tau"] = self.tau.item()
         return dLayer
 
