@@ -16,6 +16,7 @@ import jax
 from jax import jit, custom_gradient
 from jax.lax import scan
 import jax.random as rand
+from jax.ops import index_update, index
 
 from typing import Optional, Tuple, Union, Dict, Callable, Any
 
@@ -2817,7 +2818,6 @@ def _evolve_jit_ADS(state0,
         state["t"] += 1
         return (weights_slow, state, static_params), (state["Vmem"],state["spikes"],state["rate"], state["Isyn_out"])
 
-
     @jit
     def forward_train(train_state, input_target_pair):
         (weights_slow, state,static_params) = train_state
@@ -2827,6 +2827,7 @@ def _evolve_jit_ADS(state0,
         dte = static_params["weights_in"].T @ err
         state["Isyn_kdte"] = static_params["k"]*(dte)
         dot_W_slow = (rate @ dte.T)*static_params["eta"]
+        dot_W_slow = index_update(dot_W_slow, index[onp.arange(0,dot_W_slow.shape[0],1),onp.arange(0,dot_W_slow.shape[0],1)], 0)
         weights_slow += dot_W_slow
         return (weights_slow, state, static_params), (state["Vmem"],state["spikes"],state["rate"], state["Isyn_out"])
 
