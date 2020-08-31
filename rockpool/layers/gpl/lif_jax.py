@@ -3,11 +3,13 @@
 #
 
 # - Imports
+from warnings import warn
 from ..layer import Layer
 from ..training import JaxTrainer
 from ...timeseries import TSContinuous, TSEvent
 
 from jax import numpy as np
+from jax import vmap
 import numpy as onp
 
 import jax
@@ -2378,3 +2380,490 @@ class FFExpSynJax(FFExpSynCurrentInJax):
 
         # - Return output currents
         return self._i_syn_last_evolution
+
+
+class JaxADS(Layer):
+
+    def __init__(self,
+                    weights_in : np.ndarray,
+                    weights_out : np.ndarray,
+                    weights_fast : np.ndarray,
+                    weights_slow : np.ndarray,
+                    eta : float,
+                    k : float,
+                    noise_std : float,
+                    dt : float,
+                    bias : np.ndarray = 0.0,
+                    v_thresh: Union[np.ndarray, float] = 1.0,
+                    v_reset: Union[np.ndarray, float] = 0.0,
+                    v_rest: Union[np.ndarray, float] = 0.5,
+                    tau_mem: float = 0.05,
+                    tau_syn_r_fast: float = 0.001,
+                    tau_syn_r_slow: float = 0.07,
+                    tau_syn_r_out: float = 0.07,
+                    t_ref : float = 0.0,
+                    discretize=-1,
+                    discretize_dynapse=False,
+                    name : str = "JaxADS"
+                    ):
+
+        super().__init__(weights=onp.array(weights_slow), dt=dt, noise_std=noise_std, name=name)
+
+        self.weights_in = onp.array(weights_in)
+        self.weights_slow = onp.array(weights_slow)
+        self.weights_fast = onp.array(weights_fast)
+        self.weights_out = onp.array(weights_out)
+        self.eta = eta
+        self.k = k
+        self.v_thresh = onp.array(v_thresh)
+        self.v_rest = onp.array(v_rest),
+        self.v_reset = onp.array(v_reset)
+        self.t_ref = t_ref
+        self.bias = onp.array(bias)
+        self.tau_mem = onp.array(tau_mem)
+        self.tau_syn_r_fast = onp.array(tau_syn_r_fast)
+        self.tau_syn_r_slow = onp.array(tau_syn_r_slow)
+        self.tau_syn_r_out = onp.array(tau_syn_r_out)
+        self._state = {}
+        self._rng_key = rand.PRNGKey(1)
+        self.reset_state()
+        self.randomize_state()
+
+    def reset_state(self):
+        self.state = {"spikes": np.zeros((self.size,1)),
+                        "Vmem": np.zeros((self.size,1)),
+                        "Isyn_slow": np.zeros((self.size,1)),
+                        "Isyn_fast": np.zeros((self.size,1)),
+                        "Isyn_out": np.zeros((self.weights_in.shape[0],1)),
+                        "Isyn_kdte": np.zeros((self.size,1)),
+                        "rate": np.zeros((self.size,1)),
+                        "t": 0,
+                        "tlast": np.zeros((self.size,1))}
+
+    def randomize_state(self):
+        _, subkey = rand.split(self._rng_key)
+        tmp = self.state; tmp["Vmem"] = self.v_reset.reshape((-1,1)) + rand.uniform(subkey, shape=(self.size,1),minval=self.v_reset[0], maxval=self.v_thresh[0])
+        self.state = tmp
+
+
+    @property
+    def _evolve_functional(self):
+
+        def evol_func(
+            params: Params, is_learning: bool, sp_input_ts: np.ndarray,
+        ) -> Tuple[np.ndarray, State, Dict[str, np.ndarray]]:
+            # - Call the jitted evolution function for this layer
+            # - Prepare the input
+            if(is_learning):
+                # - Unpack input and target
+                (inps, I_target) = sp_input_ts
+            else:
+                inps = sp_input_ts
+                I_target = None
+
+            (
+                new_state,
+                Vmem_ts,
+                spikes_ts,
+                rates_ts,
+                output_ts,
+                weights_slow
+            ) = _evolve_jit_ADS(
+                self.state,
+                self.weights_in,
+                self.weights_out,
+                self.weights_fast,
+                params["weights_slow"],
+                self.tau_mem,
+                self.tau_syn_r_fast,
+                self.tau_syn_r_slow,
+                self.tau_syn_r_out,
+                self.bias,
+                self.t_ref,
+                self.k,
+                self.eta,
+                self.v_thresh,
+                self.v_rest,
+                self.v_reset,
+                self.noise_std,
+                inps,
+                self._rng_key,
+                self.dt,
+                is_learning,
+                I_target
+            )
+
+            # - Return the outputs from this layer, and the final layer state
+            states_t = {
+                "Vmem": Vmem_ts,
+                "rates": rates_ts,
+                "output_ts": output_ts,
+                "weights_slow": weights_slow
+            }
+            return np.squeeze(spikes_ts, axis=-1), new_state, states_t
+
+        # - Return the evolution function
+        return evol_func
+
+
+    def _pack(self):
+        return { "weights_slow": self.weights_slow }
+    
+    def _unpack(self, params):
+        self.weights_slow = params["weights_slow"]
+
+    def prepare_input(self,ts_input,duration = None,num_timesteps = None):
+        if(isinstance(ts_input, np.ndarray)):
+            # - Check if we need to add an extra dimension for batch
+            inps = ts_input
+            if(ts_input.ndim == 1):
+                inps = np.reshape(ts_input, (1,-1,1))
+            elif(ts_input.ndim == 2):
+                inps = np.reshape(ts_input, (1,ts_input.shape[0],ts_input.shape[1]))
+            elif(ts_input.ndim > 3):
+                raise Exception("Number of input dimensions unequal to 1 or 2")
+        elif(isinstance(ts_input,TSContinuous)):
+            _, inps, _ = self._prepare_input(ts_input, duration, num_timesteps)
+            inps = np.reshape(inps, (1,inps.shape[0],inps.shape[1]))
+        else:
+            raise Exception("Please input np.ndarray or TSContinuous type for input")
+        num_timesteps = inps.shape[1]-1 # - TODO Ex. 14999 is returned for TSCon. with 15000 dim. (?)
+        time_base = np.arange(0,inps.shape[1]*self.dt,self.dt)
+        return (num_timesteps,time_base,inps)
+
+    def evolve(
+        self,
+        ts_input: Optional[TSEvent] = None,
+        duration: Optional[float] = None,
+        num_timesteps: Optional[int] = None,
+        verbose: bool = False,
+    ):
+        num_timesteps,_,inps = self.prepare_input(ts_input, duration=duration, num_timesteps=num_timesteps)
+        _, _, states_t = vmap(self._evolve_functional, in_axes=(None,None,0))(self._pack(), False,inps)
+        self._timestep += num_timesteps
+        return np.squeeze(states_t["output_ts"], axis=-1)
+
+    
+    def train_output_target(self,
+                            ts_input,
+                            ts_target,
+                            eta,
+                            k,
+                            duration: Optional[float] = None,
+                            num_timesteps: Optional[int] = None,
+                            verbose: bool = False
+                            ):
+
+        self.eta = eta
+        self.k = k
+
+        _,_,inps = self.prepare_input(ts_input, duration=duration, num_timesteps=num_timesteps)
+        _,_,targets = self.prepare_input(ts_target)
+        _, _, states_t = vmap(self._evolve_functional, in_axes=(None,None,0))(self._pack(), True,(inps,targets))
+
+        # - Perform update
+        self.weights_slow = onp.array(np.mean(states_t["weights_slow"], axis=0))
+        output = onp.squeeze(onp.array(states_t["output_ts"]), axis=-1)
+
+        self._timestep += num_timesteps
+        return output
+
+
+    def to_dict(self):
+        config = super().to_dict()
+        config.pop("weights")
+        config["weights_in"] = onp.array(self.weights_in).tolist()
+        config["weights_slow"] = onp.array(self.weights_slow).tolist()
+        config["weights_fast"] = onp.array(self.weights_fast).tolist()
+        config["weights_out"] = onp.array(self.weights_out).tolist()
+        config["v_thresh"] = onp.array(self.v_thresh).tolist()
+        config["v_rest"] = onp.array(self.v_rest).tolist()
+        config["v_reset"] = onp.array(self.v_reset).tolist()
+        config["t_ref"] = float(self.t_ref)
+        config["k"] = float(self.k)
+        config["eta"] = float(self.eta)
+        config["bias"] = onp.array(self.bias).tolist()
+        config["tau_mem"] = onp.array(self.tau_mem).tolist()
+        config["tau_syn_r_slow"] = onp.array(self.tau_syn_r_slow).tolist()
+        config["tau_syn_r_fast"] = onp.array(self.tau_syn_r_fast).tolist()
+        config["tau_syn_r_out"] = onp.array(self.tau_syn_r_out).tolist()
+        config["rng_key"] = onp.array(self._rng_key).tolist()
+        return config
+
+    @classmethod
+    def load_from_dict(cls: Any, config: Dict, **kwargs):
+        # - Overwrite parameters with kwargs
+        config = dict(config, **kwargs)
+        config.pop("rng_key")
+        # - Remove class name from dict
+        config.pop("class_name")
+        lyr = cls(**config)
+        return lyr
+
+    
+    @property
+    def tau_syn_r_slow(self):
+        return onp.array(self._tau_syn_r_slow)
+    @tau_syn_r_slow.setter
+    def tau_syn_r_slow(self, value):
+        self._tau_syn_r_slow = onp.array(self._expand_to_net_size(value, "tau_syn_r_slow", False))
+
+    @property
+    def tau_syn_r_fast(self):
+        return onp.array(self._tau_syn_r_fast)
+    @tau_syn_r_fast.setter
+    def tau_syn_r_fast(self, value):
+        self._tau_syn_r_fast = onp.array(self._expand_to_net_size(value, "tau_syn_r_fast", False))
+
+    @property
+    def tau_syn_r_out(self):
+        return onp.array(self._tau_syn_r_out)
+    @tau_syn_r_out.setter
+    def tau_syn_r_out(self, value):
+        self._tau_syn_r_out = onp.array(self._expand_to_net_size(value, "tau_syn_r_out", False))
+
+    @property
+    def tau_mem(self):
+        return onp.array(self._tau_mem)
+    @tau_mem.setter
+    def tau_mem(self, value):
+        self._tau_mem = onp.array(self._expand_to_net_size(value, "tau_mem", False))
+
+    @property
+    def bias(self):
+        return onp.array(self._bias)
+    @bias.setter
+    def bias(self, value):
+        self._bias = onp.array(self._expand_to_net_size(value, "bias", False))
+
+    @property
+    def v_thresh(self):
+        return onp.array(self._v_thresh)
+    @v_thresh.setter
+    def v_thresh(self, value):
+        self._v_thresh = onp.array(self._expand_to_net_size(value, "v_thresh", False))
+
+    @property
+    def v_rest(self):
+        return onp.array(self._v_rest)
+    @v_rest.setter
+    def v_rest(self, value):
+        self._v_rest = onp.array(self._expand_to_net_size(value, "v_rest", False))
+
+    @property
+    def v_reset(self):
+        return onp.array(self._v_reset)
+    @v_reset.setter
+    def v_reset(self, value):
+        self._v_reset = onp.array(self._expand_to_net_size(value, "v_reset", False))
+
+    @property
+    def state(self):
+        """
+        Internal state of the neurons in this layer
+        :return: dict{"Vmem", "Isyn", "Isyn_slow", "Isyn_fast", "Isyn_out", "Isyn_kdte", "spikes", "t", "tlast", "rate"}
+        """
+        return {k: np.array(v) for k, v in self._state.items()}
+
+    @state.setter
+    def state(self, new_state):
+        """
+        Setter for state values. Verifies that new state dict contains correct keys and sizes.
+        """
+        # - Verify that `new_state` contains the correct keys
+        if (
+            "Vmem" not in new_state.keys()
+            or "Isyn_slow" not in new_state.keys()
+            or "Isyn_fast" not in new_state.keys()
+            or "Isyn_out" not in new_state.keys()
+            or "Isyn_kdte" not in new_state.keys()
+            or "spikes" not in new_state.keys()
+            or "t" not in new_state.keys()
+            or "tlast" not in new_state.keys()
+            or "rate" not in new_state.keys()
+        ):
+            raise ValueError(
+                "`new_state` must be a dict containing Vmem Isyn Isyn_slow Isyn_fast Isyn_out spikes t tlast and rate"
+            )
+
+        # - Update state dictionary
+        self._state.update(new_state)
+
+    def _prepare_input_continuous(
+        self,
+        ts_input: Optional[TSContinuous] = None,
+        duration: Optional[float] = None,
+        num_timesteps: Optional[int] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, int]:
+        """
+        Sample input, set up time base
+
+        This function checks an input signal, and prepares a discretised time base according to the time step of the current layer
+
+        :param Optional[TSContinuous] ts_input: :py:class:`.TSContinuous` of TxM or Tx1 Input signals for this layer
+        :param Optional[float] duration:        Duration of the desired evolution, in seconds. If not provided, then either ``num_timesteps`` or the duration of ``ts_input`` will define the evolution time
+        :param Optional[int] num_timesteps:     Integer number of evolution time steps, in units of ``.dt``. If not provided, then ``duration`` or the duration of ``ts_input`` will define the evolution time
+
+        :return (ndarray, ndarray, int): (time_base, input_steps, num_timesteps)
+            time_base:      T1 Discretised time base for evolution
+            input_steps:    (T1xN) Discretised input signal for layer
+            num_timesteps:  Actual number of evolution time steps, in units of ``.dt``
+        """
+
+        # - Work out how many time steps to take
+        num_timesteps = self._determine_timesteps(ts_input, duration, num_timesteps)
+
+        # - Generate discrete time base
+        time_base = self._gen_time_trace(self.t, num_timesteps)
+
+        if ts_input is not None:
+            # - Make sure time_base matches ts_input
+            if not isinstance(ts_input, TSEvent):
+                if not ts_input.periodic:
+                    # - If time base limits are very slightly beyond ts_input.t_start and ts_input.t_stop, match them
+                    if (
+                        ts_input.t_start - 1e-3 * self.dt
+                        <= time_base[0]
+                        <= ts_input.t_start
+                    ):
+                        time_base[0] = ts_input.t_start
+                    if (
+                        ts_input.t_stop
+                        <= time_base[-1]
+                        <= ts_input.t_stop + 1e-3 * self.dt
+                    ):
+                        time_base[-1] = ts_input.t_stop
+
+                # - Warn if evolution period is not fully contained in ts_input
+                if not (ts_input.contains(time_base) or ts_input.periodic):
+                    warn(
+                        "Layer `{}`: Evolution period (t = {} to {}) ".format(
+                            self.name, time_base[0], time_base[-1]
+                        )
+                        + "is not fully contained in input signal (t = {} to {}).".format(
+                            ts_input.t_start, ts_input.t_stop
+                        )
+                        + " You may need to use a `periodic` time series."
+                    )
+
+            # - Sample input trace and check for correct dimensions
+            input_steps = ts_input(time_base)
+
+            # - Treat "NaN" as zero inputs
+            input_steps[np.where(np.isnan(input_steps))] = 0
+
+        else:
+            # - Assume zero inputs
+            input_steps = np.zeros((np.size(time_base), self.size_in))
+
+        return time_base, input_steps, num_timesteps
+
+
+@jax.partial(jax.jit, static_argnums=(20,))
+def _evolve_jit_ADS(state0,
+                        weights_in,
+                        weights_out,
+                        weights_fast,
+                        weights_slow,
+                        tau_mem,
+                        tau_syn_r_fast,
+                        tau_syn_r_slow,
+                        tau_syn_r_out,
+                        bias,
+                        t_ref,
+                        k,
+                        eta,
+                        v_thresh,
+                        v_rest,
+                        v_reset,
+                        noise_std,
+                        I_input,
+                        key,
+                        dt,
+                        is_learning,
+                        I_target):
+
+    tau_syn_r_fast = tau_syn_r_fast.reshape((-1,1))
+    tau_syn_r_slow = tau_syn_r_slow.reshape((-1,1))
+    tau_syn_r_out = tau_syn_r_out.reshape((-1,1))
+    tau_mem = tau_mem.reshape((-1,1))
+    v_thresh = v_thresh.reshape((-1,1))
+    v_rest = v_rest.reshape((-1,1))
+    v_reset = v_reset.reshape((-1,1))
+    bias = bias.reshape((-1,1))
+    tau_mem_kernel = (dt / tau_mem)
+    exp_tau_syn_r_fast_kernel = np.exp(-dt / tau_syn_r_fast)
+    exp_tau_syn_r_slow_kernel = np.exp(-dt / tau_syn_r_slow)
+    exp_tau_syn_r_out_kernel = np.exp(-dt / tau_syn_r_out)
+
+    state = state0
+
+    @jit
+    def forward(evolve_state, I_input_ts):
+        (weights_slow, state, static_params) = evolve_state
+        I = state["Isyn_slow"] + state["Isyn_fast"] + state["Isyn_kdte"] + (I_input_ts @ static_params["weights_in"]).reshape((-1,1)) + static_params["bias"]
+        dv = ((static_params["dt"]*state["t"])>(state["tlast"] + static_params["t_ref"])).astype(np.int32) * (static_params["v_rest"]-state["Vmem"]+I)
+        state["Vmem"] = state["Vmem"] + static_params["tau_mem_kernel"] * dv
+        state["spikes"] = (state["Vmem"]>=static_params["v_thresh"]).astype(np.float32)
+        I_rec_slow = (weights_slow.T @ state["spikes"]).reshape((-1,1))
+        I_rec_fast = (static_params["weights_fast"] @ state["spikes"]).reshape((-1,1))
+        state["tlast"] = state["tlast"] + (static_params["dt"]*state["t"] -state['tlast']) * state["spikes"]
+        state["Isyn_slow"] = state["Isyn_slow"]*static_params["exp_tau_syn_r_slow_kernel"] + I_rec_slow/static_params["tau_syn_r_slow"]
+        state["Isyn_fast"] = state["Isyn_fast"]*static_params["exp_tau_syn_r_fast_kernel"] + I_rec_fast/static_params["tau_syn_r_fast"]
+        state["rate"] = state["rate"] * static_params["exp_tau_syn_r_out_kernel"] + state["spikes"]/static_params["tau_syn_r_out"]
+        state["Isyn_out"] = static_params["weights_in"] @ state["rate"]
+        state["Vmem"] = state["Vmem"] + (5 - state["Vmem"]) * state["spikes"]
+        state["Vmem"] = state["Vmem"] + (static_params["v_reset"] - state["Vmem"]) * state["spikes"]
+        state["t"] += 1
+        return (weights_slow, state, static_params), (state["Vmem"],state["spikes"],state["rate"], state["Isyn_out"])
+
+
+    @jit
+    def forward_train(train_state, input_target_pair):
+        (weights_slow, state,static_params) = train_state
+        (I_input_ts, I_target_ts) = input_target_pair
+        (weights_slow,state,static_params), (_, _, rate, Isyn_out) = forward((weights_slow,state,static_params), I_input_ts)
+        err = I_target_ts.reshape((-1,1)) - Isyn_out
+        dte = static_params["weights_in"].T @ err
+        state["Isyn_kdte"] = static_params["k"]*(dte)
+        dot_W_slow = (rate @ dte.T)*static_params["eta"]
+        weights_slow += dot_W_slow
+        return (weights_slow, state, static_params), (state["Vmem"],state["spikes"],state["rate"], state["Isyn_out"])
+
+
+    # - Create membrane potential noise trace
+    num_timesteps = I_input.shape[0]
+    _, subkey = rand.split(key)
+    noise_ts = noise_std * rand.normal(subkey, shape=(num_timesteps, I_input.shape[1]))
+    I_input = I_input + noise_ts
+
+    static_params = {}
+    static_params["v_thresh"] = v_thresh
+    static_params["v_rest"] = v_rest
+    static_params["v_reset"] = v_reset
+    static_params["bias"] = bias
+    static_params["tau_mem_kernel"] = tau_mem_kernel
+    static_params["exp_tau_syn_r_fast_kernel"] = exp_tau_syn_r_fast_kernel
+    static_params["exp_tau_syn_r_slow_kernel"] = exp_tau_syn_r_slow_kernel
+    static_params["exp_tau_syn_r_out_kernel"] = exp_tau_syn_r_out_kernel
+    static_params["tau_syn_r_fast"] = tau_syn_r_fast
+    static_params["tau_syn_r_slow"] = tau_syn_r_slow
+    static_params["tau_syn_r_out"] = tau_syn_r_out
+    static_params["dt"] = dt
+    static_params["weights_in"] = weights_in
+    static_params["weights_out"] = weights_out
+    static_params["weights_fast"] = weights_fast
+    static_params["t_ref"] = t_ref
+    static_params["k"] = k
+    static_params["eta"] = eta
+
+    if(not is_learning):
+        (weights_slow,state,_), (Vmem_ts, spikes_ts, rates_ts, output_ts) = scan(forward,
+                        (weights_slow, state0, static_params),
+                        I_input)
+    else:
+        (weights_slow,state,_), (Vmem_ts, spikes_ts, rates_ts, output_ts) = scan(forward_train,
+                            (weights_slow,state0,static_params),
+                            (I_input, I_target))
+
+    return state, Vmem_ts, spikes_ts, rates_ts, output_ts, weights_slow
