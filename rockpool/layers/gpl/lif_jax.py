@@ -2139,7 +2139,7 @@ class FFExpSynCurrentInJax(Layer, JaxTrainer):
         dLayer = super().to_dict()
         dLayer.pop("weights")
         dLayer["w_out"] = onp.array(self._w_out).tolist()
-        dLayer["tau"] = self.tau.item()
+        dLayer["tau"] = onp.array(self.tau).tolist()
         return dLayer
 
     @property
