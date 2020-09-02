@@ -2425,6 +2425,7 @@ class JaxADS(Layer):
         self.tau_syn_r_fast = onp.array(tau_syn_r_fast)
         self.tau_syn_r_slow = onp.array(tau_syn_r_slow)
         self.tau_syn_r_out = onp.array(tau_syn_r_out)
+        self.use_batching = False
         self._state = {}
         self._rng_key = rand.PRNGKey(1)
         self.reset_state()
@@ -2450,9 +2451,7 @@ class JaxADS(Layer):
     @property
     def _evolve_functional(self):
 
-        def evol_func(
-            params: Params, is_learning: bool, sp_input_ts: np.ndarray,
-        ) -> Tuple[np.ndarray, State, Dict[str, np.ndarray]]:
+        def evol_func(params, is_learning, sp_input_ts):
             # - Call the jitted evolution function for this layer
             # - Prepare the input
             if(is_learning):
@@ -2490,8 +2489,9 @@ class JaxADS(Layer):
                 inps,
                 self._rng_key,
                 self.dt,
+                I_target,
                 is_learning,
-                I_target
+                self.use_batching
             )
 
             # - Return the outputs from this layer, and the final layer state
@@ -2550,6 +2550,7 @@ class JaxADS(Layer):
                             ts_target,
                             eta,
                             k,
+                            use_batching = False,
                             duration: Optional[float] = None,
                             num_timesteps: Optional[int] = None,
                             verbose: bool = False
@@ -2557,10 +2558,11 @@ class JaxADS(Layer):
 
         self.eta = eta
         self.k = k
+        self.use_batching = use_batching
 
         _,_,inps = self.prepare_input(ts_input, duration=duration, num_timesteps=num_timesteps)
         _,_,targets = self.prepare_input(ts_target)
-        _, _, states_t = vmap(self._evolve_functional, in_axes=(None,None,0))(self._pack(), True,(inps,targets))
+        _, _, states_t = vmap(self._evolve_functional, in_axes=(None,None,0))(self._pack(), True, (inps,targets))
 
         # - Perform update
         self.weights_slow = onp.array(np.mean(states_t["weights_slow"], axis=0))
@@ -2760,7 +2762,7 @@ class JaxADS(Layer):
         return time_base, input_steps, num_timesteps
 
 
-@jax.partial(jax.jit, static_argnums=(20,))
+# @jax.partial(jax.jit, static_argnums=(21,))
 def _evolve_jit_ADS(state0,
                         weights_in,
                         weights_out,
@@ -2781,8 +2783,9 @@ def _evolve_jit_ADS(state0,
                         I_input,
                         key,
                         dt,
+                        I_target,
                         is_learning,
-                        I_target):
+                        use_batching):
 
     tau_syn_r_fast = tau_syn_r_fast.reshape((-1,1))
     tau_syn_r_slow = tau_syn_r_slow.reshape((-1,1))
@@ -2812,7 +2815,7 @@ def _evolve_jit_ADS(state0,
         state["Isyn_slow"] = state["Isyn_slow"]*static_params["exp_tau_syn_r_slow_kernel"] + I_rec_slow/static_params["tau_syn_r_slow"]
         state["Isyn_fast"] = state["Isyn_fast"]*static_params["exp_tau_syn_r_fast_kernel"] + I_rec_fast/static_params["tau_syn_r_fast"]
         state["rate"] = state["rate"] * static_params["exp_tau_syn_r_out_kernel"] + state["spikes"]/static_params["tau_syn_r_out"]
-        state["Isyn_out"] = static_params["weights_in"] @ state["rate"]
+        state["Isyn_out"] = static_params["weights_out"].T @ state["rate"]
         state["Vmem"] = state["Vmem"] + (5 - state["Vmem"]) * state["spikes"]
         state["Vmem"] = state["Vmem"] + (static_params["v_reset"] - state["Vmem"]) * state["spikes"]
         state["t"] += 1
@@ -2827,9 +2830,19 @@ def _evolve_jit_ADS(state0,
         dte = static_params["weights_in"].T @ err
         state["Isyn_kdte"] = static_params["k"]*(dte)
         dot_W_slow = (rate @ dte.T)*static_params["eta"]
-        dot_W_slow = index_update(dot_W_slow, index[onp.arange(0,dot_W_slow.shape[0],1),onp.arange(0,dot_W_slow.shape[0],1)], 0)
+        dot_W_slow = index_update(dot_W_slow, index[np.arange(0,dot_W_slow.shape[0],1),np.arange(0,dot_W_slow.shape[0],1)], 0)
         weights_slow += dot_W_slow
         return (weights_slow, state, static_params), (state["Vmem"],state["spikes"],state["rate"], state["Isyn_out"])
+
+    @jit
+    def forward_train_batched(train_state, input_target_pair):
+        (weights_slow, state,static_params) = train_state
+        (I_input_ts, I_target_ts) = input_target_pair
+        (weights_slow,state,static_params), (_, _, _, Isyn_out) = forward((weights_slow,state,static_params), I_input_ts)
+        err = I_target_ts.reshape((-1,1)) - Isyn_out
+        dte = static_params["weights_in"].T @ err
+        state["Isyn_kdte"] = static_params["k"]*(dte)
+        return (weights_slow, state, static_params), (state["Vmem"],state["spikes"], err, state["rate"], state["Isyn_out"])
 
 
     # - Create membrane potential noise trace
@@ -2863,8 +2876,21 @@ def _evolve_jit_ADS(state0,
                         (weights_slow, state0, static_params),
                         I_input)
     else:
-        (weights_slow,state,_), (Vmem_ts, spikes_ts, rates_ts, output_ts) = scan(forward_train,
-                            (weights_slow,state0,static_params),
-                            (I_input, I_target))
+        if(use_batching):
+            (weights_slow,state,_), (Vmem_ts, spikes_ts, errors, rates_ts, output_ts) = scan(forward_train_batched,
+                                (weights_slow,state0,static_params),
+                                (I_input, I_target))
+
+            dot_weights_slow = np.squeeze(rates_ts).T @ (np.squeeze(errors) @ weights_in)
+            N = dot_weights_slow.shape[0]
+            dot_weights_slow = index_update(dot_weights_slow, index[np.arange(0,N,1),np.arange(0,N,1)], 0)
+            dot_weights_slow /= (np.sum(np.abs(dot_weights_slow)) / N**2)    
+            dot_weights_slow *= eta
+            weights_slow = weights_slow + dot_weights_slow
+        else:
+            (weights_slow,state,_), (Vmem_ts, spikes_ts, rates_ts, output_ts) = scan(forward_train,
+                                (weights_slow,state0,static_params),
+                                (I_input, I_target))
+        
 
     return state, Vmem_ts, spikes_ts, rates_ts, output_ts, weights_slow
