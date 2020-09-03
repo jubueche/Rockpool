@@ -2403,6 +2403,8 @@ class JaxADS(Layer):
                     tau_syn_r_slow: float = 0.07,
                     tau_syn_r_out: float = 0.07,
                     t_ref : float = 0.0,
+                    beta : float = 0.0,
+                    rho : float = 0.0,
                     discretize=-1,
                     discretize_dynapse=False,
                     name : str = "JaxADS"
@@ -2420,6 +2422,8 @@ class JaxADS(Layer):
         self.v_rest = onp.array(v_rest),
         self.v_reset = onp.array(v_reset)
         self.t_ref = t_ref
+        self.beta = beta
+        self.rho = rho
         self.bias = onp.array(bias)
         self.tau_mem = onp.array(tau_mem)
         self.tau_syn_r_fast = onp.array(tau_syn_r_fast)
@@ -2434,6 +2438,8 @@ class JaxADS(Layer):
     def reset_state(self):
         self.state = {"spikes": np.zeros((self.size,1)),
                         "Vmem": np.zeros((self.size,1)),
+                        "v_thresh": self.v_thresh.reshape((-1,1)),
+                        "ada": np.zeros((self.size,1)),
                         "Isyn_slow": np.zeros((self.size,1)),
                         "Isyn_fast": np.zeros((self.size,1)),
                         "Isyn_out": np.zeros((self.weights_in.shape[0],1)),
@@ -2443,8 +2449,8 @@ class JaxADS(Layer):
                         "tlast": np.zeros((self.size,1))}
 
     def randomize_state(self):
-        _, subkey = rand.split(self._rng_key)
-        tmp = self.state; tmp["Vmem"] = self.v_reset.reshape((-1,1)) + rand.uniform(subkey, shape=(self.size,1),minval=self.v_reset[0], maxval=self.v_thresh[0])
+        tmp = self.state; tmp["Vmem"] = self.v_reset.reshape((-1,1)) + rand.uniform(self._rng_key, shape=(self.size,1),minval=self.v_reset[0], maxval=self.v_thresh[0])
+        _, self._rng_key = rand.split(self._rng_key)
         self.state = tmp
 
 
@@ -2480,6 +2486,8 @@ class JaxADS(Layer):
                 self.tau_syn_r_out,
                 self.bias,
                 self.t_ref,
+                self.beta,
+                self.rho,
                 self.k,
                 self.eta,
                 self.v_thresh,
@@ -2762,7 +2770,7 @@ class JaxADS(Layer):
         return time_base, input_steps, num_timesteps
 
 
-# @jax.partial(jax.jit, static_argnums=(21,))
+@jax.partial(jax.jit, static_argnums=(23,))
 def _evolve_jit_ADS(state0,
                         weights_in,
                         weights_out,
@@ -2774,6 +2782,8 @@ def _evolve_jit_ADS(state0,
                         tau_syn_r_out,
                         bias,
                         t_ref,
+                        beta,
+                        rho,
                         k,
                         eta,
                         v_thresh,
@@ -2808,7 +2818,9 @@ def _evolve_jit_ADS(state0,
         I = state["Isyn_slow"] + state["Isyn_fast"] + state["Isyn_kdte"] + (I_input_ts @ static_params["weights_in"]).reshape((-1,1)) + static_params["bias"]
         dv = ((static_params["dt"]*state["t"])>(state["tlast"] + static_params["t_ref"])).astype(np.int32) * (static_params["v_rest"]-state["Vmem"]+I)
         state["Vmem"] = state["Vmem"] + static_params["tau_mem_kernel"] * dv
-        state["spikes"] = (state["Vmem"]>=static_params["v_thresh"]).astype(np.float32)
+        state["spikes"] = (state["Vmem"]>=state["v_thresh"]).astype(np.float32)
+        state["ada"] = static_params["rho"]*state["ada"] + state["spikes"]
+        state["v_thresh"] = static_params["v_thresh"] + static_params["beta"]*state["ada"] 
         I_rec_slow = (weights_slow.T @ state["spikes"]).reshape((-1,1))
         I_rec_fast = (static_params["weights_fast"] @ state["spikes"]).reshape((-1,1))
         state["tlast"] = state["tlast"] + (static_params["dt"]*state["t"] -state['tlast']) * state["spikes"]
@@ -2868,6 +2880,8 @@ def _evolve_jit_ADS(state0,
     static_params["weights_out"] = weights_out
     static_params["weights_fast"] = weights_fast
     static_params["t_ref"] = t_ref
+    static_params["beta"] = beta
+    static_params["rho"] = rho
     static_params["k"] = k
     static_params["eta"] = eta
 
