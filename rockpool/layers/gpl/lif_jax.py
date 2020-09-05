@@ -16,7 +16,7 @@ import jax
 from jax import jit, custom_gradient
 from jax.lax import scan
 import jax.random as rand
-from jax.ops import index_update, index
+from jax.ops import index_update, index, index_mul
 
 from typing import Optional, Tuple, Union, Dict, Callable, Any
 
@@ -2295,6 +2295,18 @@ class FFExpSynJax(FFExpSynCurrentInJax):
     This layer supports the :py:class:`JaxTrainer` interface, permitting gradient-descent training using the method :py:meth:`~.FFExpSynCurrentInJax.train_output_target`.
     """
 
+    def _pack(self) -> Params:
+        """
+        Return a packed form of the tunable parameters for this layer
+
+        :return Params: params: All parameters as a Dict
+        """
+        return {
+            "weights": self._weights,
+            "tau": self._tau,
+            "tau_mem": np.inf,
+        }
+
     @property
     def input_type(self):
         return TSEvent
@@ -2430,6 +2442,9 @@ class JaxADS(Layer):
         self.tau_syn_r_slow = onp.array(tau_syn_r_slow)
         self.tau_syn_r_out = onp.array(tau_syn_r_out)
         self.use_batching = False
+        self.t_start_suppress = 0.0
+        self.t_stop_suppress = 0.0
+        self.percentage_suppress = 0.0
         self._state = {}
         self._rng_key = rand.PRNGKey(1)
         self.reset_state()
@@ -2498,6 +2513,9 @@ class JaxADS(Layer):
                 self._rng_key,
                 self.dt,
                 I_target,
+                self.t_start_suppress,
+                self.t_stop_suppress,
+                self.percentage_suppress,
                 is_learning,
                 self.use_batching
             )
@@ -2770,7 +2788,7 @@ class JaxADS(Layer):
         return time_base, input_steps, num_timesteps
 
 
-@jax.partial(jax.jit, static_argnums=(23,))
+@jax.partial(jax.jit, static_argnums=(23,24,25,26,27))
 def _evolve_jit_ADS(state0,
                         weights_in,
                         weights_out,
@@ -2794,6 +2812,9 @@ def _evolve_jit_ADS(state0,
                         key,
                         dt,
                         I_target,
+                        t_start_suppress,
+                        t_stop_suppress,
+                        percentage_suppress,
                         is_learning,
                         use_batching):
 
@@ -2818,6 +2839,8 @@ def _evolve_jit_ADS(state0,
         I = state["Isyn_slow"] + state["Isyn_fast"] + state["Isyn_kdte"] + (I_input_ts @ static_params["weights_in"]).reshape((-1,1)) + static_params["bias"]
         dv = ((static_params["dt"]*state["t"])>(state["tlast"] + static_params["t_ref"])).astype(np.int32) * (static_params["v_rest"]-state["Vmem"]+I)
         state["Vmem"] = state["Vmem"] + static_params["tau_mem_kernel"] * dv
+        is_bigger = 1-(state["t"]*static_params["dt"] > static_params["t_start_suppress"]).astype(np.int32) * (state["t"]*static_params["dt"] < static_params["t_stop_suppress"]).astype(np.int32)
+        state["Vmem"] = index_mul(state["Vmem"], static_params["percentage_suppress"], is_bigger)
         state["spikes"] = (state["Vmem"]>=state["v_thresh"]).astype(np.float32)
         state["ada"] = static_params["rho"]*state["ada"] + state["spikes"]
         state["v_thresh"] = static_params["v_thresh"] + static_params["beta"]*state["ada"] 
@@ -2884,6 +2907,10 @@ def _evolve_jit_ADS(state0,
     static_params["rho"] = rho
     static_params["k"] = k
     static_params["eta"] = eta
+    static_params["t_start_suppress"] = t_start_suppress
+    static_params["t_stop_suppress"] = t_stop_suppress
+    static_params["percentage_suppress"] = index[np.arange(0,int(v_thresh.shape[0]*percentage_suppress),1)]
+    static_params["percentage_suppress"] = index[onp.random.choice(onp.arange(0,v_thresh.shape[0],1), size=int(v_thresh.shape[0]*percentage_suppress), replace=False)]
 
     if(not is_learning):
         (weights_slow,state,_), (Vmem_ts, spikes_ts, rates_ts, output_ts) = scan(forward,

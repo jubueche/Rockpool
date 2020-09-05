@@ -231,6 +231,7 @@ class JaxStack(Network, Layer, JaxTrainer):
 
                 # - Record states
                 new_states.append(new_state)
+                states_t["out"] = out
                 layer_states_t.append(states_t)
 
                 # - Set up inputs for next layer
