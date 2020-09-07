@@ -2491,28 +2491,6 @@ class JaxFORCE(Layer):
                 I_target
             )
 
-            # _evolve_jit_FORCE(
-            #     state0 = self.state,
-            #     w_in = self.w_in,
-            #     w_rec = self.w_rec,
-            #     w_out = params["w_out"],
-            #     PInv = params["PInv"],
-            #     tau_mem = self.tau_mem,
-            #     tau_syn = self.tau_syn,
-            #     bias = self.bias,
-            #     t_ref = self.t_ref,
-            #     v_thresh = self.v_thresh,
-            #     v_reset = self.v_reset,
-            #     noise_std = self.noise_std,
-            #     I_input = inps,
-            #     key = self._rng_key,
-            #     dt = self.dt,
-            #     alpha = self.alpha,
-            #     is_learning = is_learning,
-            #     E = self.E,
-            #     I_target = I_target
-            # )
-
             # - Return the outputs from this layer, and the final layer state
             states_t = {
                 "Vmem": Vmem_ts,
@@ -2564,7 +2542,7 @@ class JaxFORCE(Layer):
     ):
         num_timesteps,_,inps = self.prepare_input(ts_input, duration=duration, num_timesteps=num_timesteps)
         _, _, states_t = vmap(self._evolve_functional, in_axes=(None,None,0))(self._pack(), False,inps)
-        self._timestep += num_timesteps # - TODO (?)
+        self._timestep += num_timesteps
         return np.squeeze(states_t["output_ts"], axis=-1)
 
     def train_output_target(self,
@@ -2577,16 +2555,8 @@ class JaxFORCE(Layer):
 
         num_timesteps,_,inps = self.prepare_input(ts_input, duration=duration, num_timesteps=num_timesteps)
         _,_,targets = self.prepare_input(ts_target)
-        # process = psutil.Process(os.getpid())
-        # print("1",process.memory_info().rss)  # in bytes
         _, _, states_t = vmap(self._evolve_functional, in_axes=(None,None,0))(self._pack(), True,(inps,targets))
-        states_t["output_ts"].block_until_ready()
-        # process = psutil.Process(os.getpid())
-        # print("2",process.memory_info().rss)  # in bytes
-
-        # jax.profiler.save_device_memory_profile(f"memory{self.mem_id}.prof")
-        # self.mem_id += 1
-
+        
         # - Perform update
         self.w_out = onp.array(np.mean(states_t["w_out"], axis=0))
         self.PInv = onp.array(np.mean(states_t["PInv"], axis=0))
