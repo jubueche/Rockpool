@@ -2760,10 +2760,10 @@ def _evolve_jit_FORCE(state0,
         state = state0
 
         @jit
-        def forward_train(train_state, input_target_pair):
+        def forward_train(train_state, input_triple):
             (w_out, PInv, state,static_params) = train_state
-            (I_input_ts, I_target_ts) = input_target_pair
-            (w_out,state,static_params), (_, _, _, z) = forward((w_out,state,static_params), I_input_ts)
+            (I_input_ts, I_target_ts, noise_ts) = input_triple
+            (w_out,state,static_params), (_, _, _, z) = forward((w_out,state,static_params), (I_input_ts,noise_ts))
             err = z - I_target_ts.reshape((-1,1))
             cd = PInv @ state["r"]
             w_out = w_out - (cd @ err.T)
@@ -2771,10 +2771,11 @@ def _evolve_jit_FORCE(state0,
             return (w_out, PInv, state, static_params), (state["Vmem"],state["spikes"],state["r"], z)
 
         @jit
-        def forward(evolve_state, I_input_ts):
+        def forward(evolve_state, I_input_noise_pair):
+            (I_input_ts, noise_ts) = I_input_noise_pair
             (w_out, state, static_params) = evolve_state
             z = w_out.T @ state["r"]
-            I = state["Isyn"] + static_params["E"] @ z + (I_input_ts @ static_params["w_in"]).reshape((-1,1)) + static_params["bias"]
+            I = state["Isyn"] + static_params["E"] @ z + (I_input_ts @ static_params["w_in"]).reshape((-1,1)) + noise_ts.reshape((-1,1)) + static_params["bias"]
             dv = ((static_params["dt"]*state["t"])>(state["tlast"] + static_params["t_ref"])).astype(np.int32) * (-state["Vmem"]+I)
             state["Vmem"] = state["Vmem"] + static_params["tau_mem_kernel"] * dv
             state["spikes"] = (state["Vmem"]>=static_params["v_thresh"]).astype(np.float32)
@@ -2791,10 +2792,8 @@ def _evolve_jit_FORCE(state0,
         num_timesteps = I_input.shape[0]
         _, subkey = rand.split(key)
         noise_ts = noise_std * rand.normal(
-            subkey, shape=(num_timesteps, I_input.shape[1])
+            subkey, shape=(num_timesteps, w_rec.shape[0])
         )
-
-        I_input = I_input + noise_ts
 
         static_params = {}
         static_params["v_thresh"] = v_thresh
@@ -2812,10 +2811,10 @@ def _evolve_jit_FORCE(state0,
         if(not is_learning):
             (w_out,state,_), (Vmem_ts, spikes_ts, r_ts, output_ts) = scan(forward,
                             (w_out,state0, static_params),
-                            I_input)
+                            (I_input,noise_ts))
         else:
             (w_out,PInv,state,_), (Vmem_ts, spikes_ts, r_ts, output_ts) = scan(forward_train,
                             (w_out,PInv,state0,static_params),
-                            (I_input, I_target))
+                            (I_input, I_target, noise_ts))
 
         return state, Vmem_ts, spikes_ts, r_ts, output_ts, PInv, w_out
