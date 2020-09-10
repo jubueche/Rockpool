@@ -58,6 +58,7 @@ class _BaseNestProcess(multiprocessing.Process):
         v_reset: np.ndarray,
         v_rest: np.ndarray,
         refractory: np.ndarray,
+        noise_std: np.ndarray,
         record: bool = False,
         num_cores: int = 1,
     ):
@@ -76,6 +77,7 @@ class _BaseNestProcess(multiprocessing.Process):
         self.bias = A2mA(bias)
         self.capacity = F2mF(capacity)
         self.refractory = s2ms(refractory)
+        self.noise_std = noise_std
         self.record = record
         self.num_cores = num_cores
         self.model = model
@@ -120,7 +122,6 @@ class _BaseNestProcess(multiprocessing.Process):
         senders = events["senders"][use_event]
         times = events["times"][use_event]
         vms = events["V_m"][use_event]
-
 
         recorded_states = []
         u_senders = np.unique(senders)
@@ -330,6 +331,15 @@ class _BaseNestProcess(multiprocessing.Process):
         """
         self._pop = self.nest_module.Create(self.model, self.size)
 
+        # - Create Noise Generator
+        if not self.noise_std is None:
+            noise_params = [{'mean': 0.,
+                             'std': self.noise_std[i],
+                             'dt': self.dt} for i in range(len(self._pop))]
+ 
+            self._ng = self.nest_module.Create("noise_generator", len(self._pop), noise_params)            
+            self.nest_module.Connect(self._ng, self._pop, 'one_to_one')
+
         # - Add spike detector to record layer outputs
         self._sd = self.nest_module.Create("spike_detector")
         self.nest_module.Connect(self._pop, self._sd)
@@ -461,6 +471,7 @@ class _BaseNestProcessSpkInRec(_BaseNestProcess):
         v_reset: FloatVector,
         v_rest: FloatVector,
         refractory: FloatVector,
+        noise_std: FloatVector,
         record: bool = False,
         num_cores: int = 1,
     ):
@@ -475,6 +486,7 @@ class _BaseNestProcessSpkInRec(_BaseNestProcess):
             v_reset=v_reset,
             v_rest=v_rest,
             refractory=refractory,
+            noise_std=noise_std,
             record=record,
             num_cores=num_cores,
             model=model,
@@ -627,6 +639,7 @@ class FFIAFNest(Layer):
             v_reset: np.ndarray,
             v_rest: np.ndarray,
             refractory: np.ndarray,
+            noise_std: np.ndarray,
             record: bool = False,
             num_cores: int = 1,
         ):
@@ -642,6 +655,7 @@ class FFIAFNest(Layer):
                 v_reset=v_reset,
                 v_rest=v_rest,
                 refractory=refractory,
+                noise_std=noise_std,
                 record=record,
                 num_cores=num_cores,
                 model="iaf_psc_exp",
@@ -728,7 +742,7 @@ class FFIAFNest(Layer):
             """
 
             # NEST time starts with 1 (not with 0)
-            time_base = s2ms(time_base) + self.dt 
+            time_base = s2ms(time_base) + self.dt
 
             self.nest_module.SetStatus(
                 self._scg,
@@ -755,6 +769,7 @@ class FFIAFNest(Layer):
         v_reset: FloatVector = -65e-3,
         v_rest: FloatVector = -65e-3,
         refractory: FloatVector = 1e-3,
+        noise_std: FloatVector = None,
         name: str = "unnamed",
         record: bool = False,
         num_cores: int = 1,
@@ -802,6 +817,7 @@ class FFIAFNest(Layer):
         self._bias = bias
         self._capacity = capacity
         self._refractory = refractory
+        self._noise_std = noise_std
         # - Record layer settings and multiprocessing queues
         self._record = record
         self._num_cores = num_cores
@@ -828,6 +844,7 @@ class FFIAFNest(Layer):
             self._v_reset,
             self._v_rest,
             self._refractory,
+            self._noise_std,
             self._record,
             self._num_cores,
         )
@@ -895,6 +912,9 @@ class FFIAFNest(Layer):
         # - Start and stop times for output time series
         t_start = self.t
         t_stop = (self._timestep + num_timesteps) * self.dt
+
+        # - Shift event times to middle of time bins
+        event_time_out -= 0.5 * self.dt
 
         # - Update layer time step
         self._timestep += num_timesteps
@@ -968,6 +988,7 @@ class FFIAFNest(Layer):
         config["v_reset"] = self.v_reset.tolist()
         config["v_rest"] = self.v_rest.tolist()
         config["refractory"] = self.refractory.tolist()
+        config["noise_std"] = self.noise_std.tolist()
         config["name"] = self.name
         config["record"] = self.record
         config["num_cores"] = self.num_cores
@@ -1143,6 +1164,7 @@ class RecIAFSpkInNest(FFIAFNest):
             v_reset: FloatVector,
             v_rest: FloatVector,
             refractory: FloatVector,
+            noise_std: FloatVector,
             record: bool = False,
             num_cores: int = 1,
         ):
@@ -1184,6 +1206,7 @@ class RecIAFSpkInNest(FFIAFNest):
                 v_reset=v_reset,
                 v_rest=v_rest,
                 refractory=refractory,
+                noise_std=noise_std,
                 record=record,
                 num_cores=num_cores,
                 model="iaf_psc_exp",
@@ -1220,6 +1243,7 @@ class RecIAFSpkInNest(FFIAFNest):
         v_rest: FloatVector = -65e-3,
         capacity: Optional[FloatVector] = None,
         refractory: FloatVector = 1e-3,
+        noise_std: FloatVector = None,
         name: str = "unnamed",
         record: bool = False,
         num_cores: int = 1,
@@ -1283,6 +1307,7 @@ class RecIAFSpkInNest(FFIAFNest):
             v_rest=v_rest,
             capacity=capacity,
             refractory=refractory,
+            noise_std=noise_std,
             name=name,
             record=record,
             num_cores=num_cores,
@@ -1310,6 +1335,7 @@ class RecIAFSpkInNest(FFIAFNest):
             v_reset=self._v_reset,
             v_rest=self._v_rest,
             refractory=self._refractory,
+            noise_std=self._noise_std,
             record=self._record,
             num_cores=self._num_cores,
         )
