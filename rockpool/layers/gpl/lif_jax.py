@@ -2910,7 +2910,7 @@ def _evolve_jit_ADS(state0,
     static_params["t_start_suppress"] = t_start_suppress
     static_params["t_stop_suppress"] = t_stop_suppress
     static_params["percentage_suppress"] = index[np.arange(0,int(v_thresh.shape[0]*percentage_suppress),1)]
-    static_params["percentage_suppress"] = index[onp.random.choice(onp.arange(0,v_thresh.shape[0],1), size=int(v_thresh.shape[0]*percentage_suppress), replace=False)]
+    # static_params["percentage_suppress"] = index[onp.random.choice(onp.arange(0,v_thresh.shape[0],1), size=int(v_thresh.shape[0]*percentage_suppress), replace=False)]
 
     if(not is_learning):
         (weights_slow,state,_), (Vmem_ts, spikes_ts, rates_ts, output_ts) = scan(forward,
