@@ -838,11 +838,11 @@ class RecLIFJax(Layer, JaxTrainer):
         if hasattr(self, "dt"):
             tau_min = self.dt * 10.0
             numeric_eps = 1e-8
-            if np.any(value - tau_min + numeric_eps < 0):
-                raise ValueError(
-                    self.start_print
-                    + "`tau_mem` must be larger than {:4f}".format(tau_min)
-                )
+            # if np.any(value - tau_min + numeric_eps < 0):
+            #     raise ValueError(
+            #         self.start_print
+            #         + "`tau_mem` must be larger than {:4f}".format(tau_min)
+            #     )
 
         self._tau_mem = np.reshape(value, self._size).astype("float32")
 
