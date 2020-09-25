@@ -6,7 +6,7 @@
 from rockpool.timeseries import TimeSeries
 
 from jax import jit, grad, vmap, value_and_grad
-from jax.experimental.optimizers import adam
+from jax.experimental.optimizers import adam, clip_grads
 
 import itertools
 
@@ -396,6 +396,9 @@ class JaxTrainer(ABC):
                 l, g = self.__grad_fcn(
                     opt_params, input_batch_t, target_batch_t, self._state
                 )
+
+                # - Gradient clipping is important for RNNs
+                g = clip_grads(g, 0.1)
 
                 # - Call optimiser update function
                 return opt_update(i, g, opt_state), l, g
