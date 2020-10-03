@@ -2429,6 +2429,7 @@ class JaxADS(Layer):
         self.weights_fast = onp.array(weights_fast)
         self.weights_out = onp.array(weights_out)
         self.eta = eta
+        self.eta_ebn = 0.001
         self.k = k
         self.v_thresh = onp.array(v_thresh)
         self.v_rest = onp.array(v_rest),
@@ -2442,6 +2443,7 @@ class JaxADS(Layer):
         self.tau_syn_r_slow = onp.array(tau_syn_r_slow)
         self.tau_syn_r_out = onp.array(tau_syn_r_out)
         self.use_batching = False
+        self.train_ebn_flag = False
         self.t_start_suppress = 0.0
         self.t_stop_suppress = 0.0
         self.percentage_suppress = 0.0
@@ -2488,7 +2490,8 @@ class JaxADS(Layer):
                 spikes_ts,
                 rates_ts,
                 output_ts,
-                weights_slow
+                weights_slow,
+                weights_fast
             ) = _evolve_jit_ADS(
                 self.state,
                 self.weights_in,
@@ -2517,6 +2520,8 @@ class JaxADS(Layer):
                 self.t_stop_suppress,
                 self.percentage_suppress,
                 is_learning,
+                self.train_ebn_flag,
+                self.eta_ebn,
                 self.use_batching
             )
 
@@ -2525,7 +2530,8 @@ class JaxADS(Layer):
                 "Vmem": Vmem_ts,
                 "rates": rates_ts,
                 "output_ts": output_ts,
-                "weights_slow": weights_slow
+                "weights_slow": weights_slow,
+                "weights_fast": weights_fast
             }
             return np.squeeze(spikes_ts, axis=-1), new_state, states_t
 
@@ -2597,6 +2603,29 @@ class JaxADS(Layer):
         self._timestep += num_timesteps
         return output
 
+    def train_ebn(self,
+                  ts_input,
+                  eta,
+                  duration: Optional[float] = None,
+                  num_timesteps: Optional[int] = None,
+                  verbose: bool = False
+                  ):
+        self.train_ebn_flag = True
+        self.eta_ebn = eta
+        _,_,inps = self.prepare_input(ts_input, duration=duration, num_timesteps=num_timesteps)
+        spikes, _, states_t = vmap(self._evolve_functional, in_axes=(None,None,0))(self._pack(), False, inps)
+
+        # - Update EBN connections
+        self.weights_fast = onp.array(np.mean(states_t["weights_fast"], axis=0))
+        output = onp.squeeze(onp.array(states_t["output_ts"]), axis=-1)
+
+        self._timestep += num_timesteps
+        self.train_ebn_flag = False
+        if(verbose):
+            states_t["spikes"] = spikes
+            return output, states_t
+        else:
+            return output
 
     def to_dict(self):
         config = super().to_dict()
@@ -2788,7 +2817,7 @@ class JaxADS(Layer):
         return time_base, input_steps, num_timesteps
 
 
-@jax.partial(jax.jit, static_argnums=(23,24,25,26,27))
+@jax.partial(jax.jit, static_argnums=(23,24,25,26,27,28,29))
 def _evolve_jit_ADS(state0,
                         weights_in,
                         weights_out,
@@ -2816,6 +2845,8 @@ def _evolve_jit_ADS(state0,
                         t_stop_suppress,
                         percentage_suppress,
                         is_learning,
+                        is_learning_ebn,
+                        eta_ebn,
                         use_batching):
 
     tau_syn_r_fast = tau_syn_r_fast.reshape((-1,1))
@@ -2836,7 +2867,7 @@ def _evolve_jit_ADS(state0,
     @jit
     def forward(evolve_state, I_input_noise_tuple):
         (I_input_ts, noise_ts) = I_input_noise_tuple
-        (weights_slow, state, static_params) = evolve_state
+        (weights_slow,weights_fast, state, static_params) = evolve_state
         I = state["Isyn_slow"] + state["Isyn_fast"] + state["Isyn_kdte"] + (I_input_ts @ static_params["weights_in"]).reshape((-1,1)) + static_params["bias"] + noise_ts.reshape((-1,1))
         dv = ((static_params["dt"]*state["t"])>(state["tlast"] + static_params["t_ref"])).astype(np.int32) * (static_params["v_rest"]-state["Vmem"]+I)
         state["Vmem"] = state["Vmem"] + static_params["tau_mem_kernel"] * dv
@@ -2846,7 +2877,7 @@ def _evolve_jit_ADS(state0,
         state["ada"] = static_params["rho"]*state["ada"] + state["spikes"]
         state["v_thresh"] = static_params["v_thresh"] + static_params["beta"]*state["ada"] 
         I_rec_slow = (weights_slow.T @ state["spikes"]).reshape((-1,1))
-        I_rec_fast = (static_params["weights_fast"] @ state["spikes"]).reshape((-1,1))
+        I_rec_fast = (weights_fast @ state["spikes"]).reshape((-1,1))
         state["tlast"] = state["tlast"] + (static_params["dt"]*state["t"] -state['tlast']) * state["spikes"]
         state["Isyn_slow"] = state["Isyn_slow"]*static_params["exp_tau_syn_r_slow_kernel"] + I_rec_slow/static_params["tau_syn_r_slow"]
         state["Isyn_fast"] = state["Isyn_fast"]*static_params["exp_tau_syn_r_fast_kernel"] + I_rec_fast/static_params["tau_syn_r_fast"]
@@ -2855,31 +2886,40 @@ def _evolve_jit_ADS(state0,
         state["Vmem"] = state["Vmem"] + (5 - state["Vmem"]) * state["spikes"]
         state["Vmem"] = state["Vmem"] + (static_params["v_reset"] - state["Vmem"]) * state["spikes"]
         state["t"] += 1
-        return (weights_slow, state, static_params), (state["Vmem"],state["spikes"],state["rate"], state["Isyn_out"])
+        return (weights_slow,weights_fast, state, static_params), (state["Vmem"],state["spikes"],state["rate"], state["Isyn_out"])
 
     @jit
     def forward_train(train_state, input_target_triple):
-        (weights_slow, state,static_params) = train_state
+        (weights_slow,weights_fast, state,static_params) = train_state
         (I_input_ts, I_target_ts, noise_ts) = input_target_triple
-        (weights_slow,state,static_params), (_, _, rate, Isyn_out) = forward((weights_slow,state,static_params), (I_input_ts,noise_ts))
+        (weights_slow,weights_fast,state,static_params), (_, _, rate, Isyn_out) = forward((weights_slow,weights_fast,state,static_params), (I_input_ts,noise_ts))
         err = I_target_ts.reshape((-1,1)) - Isyn_out
         dte = static_params["weights_in"].T @ err
         state["Isyn_kdte"] = static_params["k"]*(dte)
         dot_W_slow = (rate @ dte.T)*static_params["eta"]
         dot_W_slow = index_update(dot_W_slow, index[np.arange(0,dot_W_slow.shape[0],1),np.arange(0,dot_W_slow.shape[0],1)], 0)
         weights_slow += dot_W_slow
-        return (weights_slow, state, static_params), (state["Vmem"],state["spikes"],state["rate"], state["Isyn_out"])
+        return (weights_slow,weights_fast, state, static_params), (state["Vmem"],state["spikes"],state["rate"], state["Isyn_out"])
 
     @jit
     def forward_train_batched(train_state, input_target_triple):
-        (weights_slow, state,static_params) = train_state
+        (weights_slow,weights_fast, state,static_params) = train_state
         (I_input_ts, I_target_ts,noise_ts) = input_target_triple
-        (weights_slow,state,static_params), (_, _, _, Isyn_out) = forward((weights_slow,state,static_params), (I_input_ts,noise_ts))
+        (weights_slow,weights_fast,state,static_params), (_, _, _, Isyn_out) = forward((weights_slow,weights_fast,state,static_params), (I_input_ts,noise_ts))
         err = I_target_ts.reshape((-1,1)) - Isyn_out
         dte = static_params["weights_in"].T @ err
         state["Isyn_kdte"] = static_params["k"]*(dte)
-        return (weights_slow, state, static_params), (state["Vmem"],state["spikes"], err, state["rate"], state["Isyn_out"])
+        return (weights_slow,weights_fast,state, static_params), (state["Vmem"],state["spikes"], err, state["rate"], state["Isyn_out"])
 
+
+    @jit
+    def forward_train_ebn(train_state, I_input_noise_tuple):
+        (weights_slow,weights_fast, state,static_params) = train_state
+        (I_input_ts,noise_ts) = I_input_noise_tuple
+        V_before = state["Vmem"]
+        (_,weights_fast,state,static_params), (_, spikes, _, _) = forward((weights_slow,weights_fast,state,static_params), (I_input_ts,noise_ts))
+        weights_fast -= static_params["eta_ebn"] * (2*V_before + weights_fast @ spikes) @ spikes.T
+        return (weights_slow,weights_fast,state, static_params), (state["Vmem"],state["spikes"], state["rate"], state["Isyn_out"])
 
     # - Create membrane potential noise trace
     num_timesteps = I_input.shape[0]
@@ -2901,25 +2941,31 @@ def _evolve_jit_ADS(state0,
     static_params["dt"] = dt
     static_params["weights_in"] = weights_in
     static_params["weights_out"] = weights_out
-    static_params["weights_fast"] = weights_fast
     static_params["t_ref"] = t_ref
     static_params["beta"] = beta
     static_params["rho"] = rho
     static_params["k"] = k
     static_params["eta"] = eta
+    static_params["eta_ebn"] = eta_ebn
     static_params["t_start_suppress"] = t_start_suppress
     static_params["t_stop_suppress"] = t_stop_suppress
     static_params["percentage_suppress"] = index[np.arange(0,int(v_thresh.shape[0]*percentage_suppress),1)]
     # static_params["percentage_suppress"] = index[onp.random.choice(onp.arange(0,v_thresh.shape[0],1), size=int(v_thresh.shape[0]*percentage_suppress), replace=False)]
 
+
     if(not is_learning):
-        (weights_slow,state,_), (Vmem_ts, spikes_ts, rates_ts, output_ts) = scan(forward,
-                        (weights_slow, state0, static_params),
-                        (I_input,noise_ts))
+        if(not is_learning_ebn):
+            (weights_slow,weights_fast,state,_), (Vmem_ts, spikes_ts, rates_ts, output_ts) = scan(forward,
+                            (weights_slow,weights_fast,state0, static_params),
+                            (I_input,noise_ts))
+        else:
+            (weights_slow,weights_fast,state,_), (Vmem_ts, spikes_ts, rates_ts, output_ts) = scan(forward_train_ebn,
+                            (weights_slow,weights_fast,state0, static_params),
+                            (I_input,noise_ts))
     else:
         if(use_batching):
-            (weights_slow,state,_), (Vmem_ts, spikes_ts, errors, rates_ts, output_ts) = scan(forward_train_batched,
-                                (weights_slow,state0,static_params),
+            (weights_slow,weights_fast,state,_), (Vmem_ts, spikes_ts, errors, rates_ts, output_ts) = scan(forward_train_batched,
+                                (weights_slow,weights_fast,state0,static_params),
                                 (I_input, I_target,noise_ts))
 
             dot_weights_slow = np.squeeze(rates_ts).T @ (np.squeeze(errors) @ weights_in)
@@ -2929,9 +2975,9 @@ def _evolve_jit_ADS(state0,
             dot_weights_slow *= eta
             weights_slow = weights_slow + dot_weights_slow
         else:
-            (weights_slow,state,_), (Vmem_ts, spikes_ts, rates_ts, output_ts) = scan(forward_train,
-                                (weights_slow,state0,static_params),
+            (weights_slow,weights_fast,state,_), (Vmem_ts, spikes_ts, rates_ts, output_ts) = scan(forward_train,
+                                (weights_slow,weights_fast,state0,static_params),
                                 (I_input, I_target,noise_ts))
         
 
-    return state, Vmem_ts, spikes_ts, rates_ts, output_ts, weights_slow
+    return state, Vmem_ts, spikes_ts, rates_ts, output_ts, weights_slow, weights_fast
